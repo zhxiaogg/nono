@@ -438,21 +438,40 @@ pub(crate) struct PreparedSandbox {
 }
 
 fn resolved_workdir(args: &SandboxArgs) -> PathBuf {
-    let path = args
-        .workdir
-        .clone()
-        .or_else(|| std::env::current_dir().ok())
-        .unwrap_or_else(|| PathBuf::from("."));
-
-    // Ensure the path is absolute (preserving symlinks) so macOS Seatbelt
-    // always receives a literal absolute path.
-    if path.is_relative() {
-        std::env::current_dir()
-            .map(|cwd| cwd.join(&path))
-            .unwrap_or(path)
-    } else {
-        path
+    if let Some(ref workdir) = args.workdir {
+        let path = workdir.clone();
+        // Ensure the CLI-supplied path is absolute (preserving symlinks) so
+        // macOS Seatbelt always receives a literal absolute path.
+        if path.is_relative() {
+            return std::env::current_dir()
+                .map(|cwd| cwd.join(&path))
+                .unwrap_or(path);
+        }
+        return path;
     }
+
+    // No --workdir supplied: prefer $PWD over getcwd().
+    //
+    // The shell sets $PWD to the path the user typed (preserving symlinks),
+    // while getcwd() / current_dir() always returns the canonical real path.
+    // When the user `cd`s into a symlinked directory, $PWD holds the symlink
+    // path and current_dir() holds the resolved target — we want the symlink
+    // path so that Seatbelt literal-path rules cover it.
+    //
+    // Safety: validate that $PWD canonicalises to the same path as getcwd()
+    // before trusting it, so a stale or spoofed $PWD is ignored.
+    let canonical_cwd = std::env::current_dir().ok();
+
+    if let Some(pwd) = std::env::var_os("PWD").map(PathBuf::from) {
+        if pwd.is_absolute() {
+            let pwd_canonical = pwd.canonicalize().ok();
+            if pwd_canonical.is_some() && pwd_canonical == canonical_cwd {
+                return pwd;
+            }
+        }
+    }
+
+    canonical_cwd.unwrap_or_else(|| PathBuf::from("."))
 }
 
 fn cwd_access_requirement(profile_workdir_access: Option<&WorkdirAccess>) -> Option<AccessMode> {
@@ -1646,6 +1665,63 @@ mod tests {
     #[test]
     fn missing_cwd_prompt_can_interactively_prompt_when_attached() {
         assert!(!missing_cwd_prompt_must_fail(false, false, None));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolved_workdir_prefers_pwd_symlink_over_getcwd_when_valid() {
+        let _lock = crate::test_env::ENV_LOCK.lock().expect("env lock");
+        let dir = tempdir().expect("tmpdir");
+
+        // Create a symlink that points to the real current working directory.
+        // $PWD must canonicalise to the same path as getcwd() for the guard to
+        // accept it — that is only true when the symlink target IS the cwd.
+        let cwd = std::env::current_dir().expect("getcwd");
+        let link_dir = dir.path().join("link");
+        std::os::unix::fs::symlink(&cwd, &link_dir).expect("symlink");
+
+        // Simulate a shell that set $PWD to the symlink path.
+        let _env = crate::test_env::EnvVarGuard::set_all(&[(
+            "PWD",
+            link_dir.to_str().expect("valid utf-8"),
+        )]);
+
+        let args = SandboxArgs {
+            workdir: None,
+            ..SandboxArgs::default()
+        };
+
+        // resolved_workdir must return the symlink path, not the canonical one.
+        let result = resolved_workdir(&args);
+        assert_eq!(
+            result, link_dir,
+            "resolved_workdir should return $PWD (symlink path) when it is valid"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolved_workdir_ignores_stale_pwd() {
+        let _lock = crate::test_env::ENV_LOCK.lock().expect("env lock");
+        let dir = tempdir().expect("tmpdir");
+
+        // $PWD points somewhere that does NOT resolve to current_dir().
+        let stale = dir.path().join("stale");
+        std::fs::create_dir_all(&stale).expect("mkdir stale");
+        let _env =
+            crate::test_env::EnvVarGuard::set_all(&[("PWD", stale.to_str().expect("valid utf-8"))]);
+
+        let args = SandboxArgs {
+            workdir: None,
+            ..SandboxArgs::default()
+        };
+
+        let result = resolved_workdir(&args);
+        // Must fall back to current_dir(), not the stale $PWD.
+        assert_ne!(
+            result, stale,
+            "resolved_workdir must not trust a stale $PWD"
+        );
     }
 
     #[test]
