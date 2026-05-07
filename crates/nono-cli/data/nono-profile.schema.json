@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://nono.dev/schemas/nono-profile.schema.json",
+  "$id": "https://nono.sh/schemas/nono-profile.schema.json",
   "title": "nono Profile",
   "description": "A nono profile definition that configures sandbox capabilities, filesystem access, network policy, and other security settings for running untrusted processes.",
   "type": "object",
