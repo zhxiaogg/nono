@@ -45,7 +45,7 @@ Most sandboxes feel like sandboxes. Rigid, sluggish, and designed for a differen
 
 ## Latest News
 
-- **nono registry** - the nono registry is in alpha and available to try. Host your skills, hooks, policy and more in your own repo, and securely host via our registry - this then gives you the ability to `nono pull org/repo` your agent skills and sandbox policies direct into the nono runtime! Check out the registry at: https://registry.nono.sh 
+- **nono registry** — The nono registry is now in alpha and available to try out. Host your skills, hooks, policies, and more in your own repository, then securely distribute them through the registry. This gives you the ability to run `nono pull org/repo` to pull agent skills and sandbox policies directly into the nono runtime. We are now in the process of migrating profiles out of tree and into their own packages. Check out the registry at: registry.nono.sh
 
 [All updates](https://github.com/always-further/nono/discussions/categories/announcements)
 
