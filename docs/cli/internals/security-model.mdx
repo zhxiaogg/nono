@@ -173,7 +173,7 @@ macOS supervised mode provides rollback snapshots and diagnostic output, but doe
 
 ### macOS Claude Code keychain scope
 
-The built-in `claude-code` profile on macOS grants read-write access to the **user** keychain root:
+The `claude-code` profile on macOS grants read-write access to the **user** keychain root:
 
 - `~/Library/Keychains`
 
@@ -190,9 +190,9 @@ Security implication:
 
 - a process running under the macOS `claude-code` profile can interact with the user's keychain subtree, not just Claude-specific entries
 
-This was chosen as a compatibility tradeoff for the built-in Claude profile. Users who need a tighter boundary should use a custom profile instead of relying on the built-in `claude-code` profile.
+This was chosen as a compatibility tradeoff for the Claude profile. Users who need a tighter boundary should use a custom profile instead of relying on the pack-provided `claude-code` profile.
 
-For users who want the built-in Claude profile shape without macOS keychain access, nono also provides:
+For users who want the Claude profile shape without macOS keychain access, nono also provides:
 
 - `claude-no-kc`
 

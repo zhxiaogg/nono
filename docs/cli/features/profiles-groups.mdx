@@ -35,7 +35,7 @@ Profiles can come from three sources, in order of precedence:
 |--------|----------|-------------|
 | CLI flags | Command line | Highest - explicit user intent |
 | User profiles | `~/.config/nono/profiles/` | Medium - user-defined |
-| Built-in profiles | Compiled into binary | Base - audited defaults |
+| Pack / preset profiles | Installed packs or compiled presets | Base - audited defaults |
 
 CLI flags always override profile settings.
 
@@ -400,7 +400,7 @@ You can also load a profile by file path:
 nono run --profile ./profiles/my-agent.json -- my-command
 ```
 
-### Overriding Built-in Profiles
+### Overriding Pack Profiles
 
 CLI flags always take precedence over profile settings:
 
@@ -425,7 +425,7 @@ To keep a base profile but clear an inherited network profile, set `network.netw
 }
 ```
 
-You can also create a user profile with the same name to override a built-in profile entirely.
+You can also create a user profile with the same name to override a pack profile entirely.
 
 ---
 
@@ -444,7 +444,7 @@ Every profile's effective capability set is built through composition:
 1. **default_profile_groups** come from the built-in `default` profile
 2. **profile.groups.include** adds additional groups on top
 3. **profile.groups.exclude** removes groups from the composed set (exclusion wins)
-4. **profile.filesystem.{allow,read,write}**, **profile.filesystem.deny**, and **profile.commands.{allow,deny}** apply additive overrides
+4. **profile.filesystem.allow/read/write**, **profile.filesystem.deny**, and **profile.commands.allow/deny** apply additive overrides
 5. **profile.filesystem.bypass_protection** punches targeted holes through deny groups (requires a matching grant in `filesystem.allow`/`read`/`write`)
 6. **CLI overrides** (`--allow`, `--read`, `--bypass-protection`, etc.) are applied last
 
@@ -558,7 +558,7 @@ Platform-specific groups use `_macos` or `_linux` suffixes by convention.
 
 ---
 
-## Built-in Profiles
+## Available Profiles
 
 ### default
 
@@ -630,20 +630,6 @@ nono run --profile openclaw -- openclaw
 
 **CWD:** Read-only
 
-### swival
-
-```bash
-nono run --profile swival -- swival
-```
-
-**Groups:** `python_runtime`, `node_runtime`, `user_caches_macos`, `user_caches_linux`, `git_config`, `unlink_protection` (plus `default` groups)
-
-**Filesystem:** `~/.config/swival`, `~/.local/share/swival` (read+write), plus git config files from `git_config` group
-
-**Network:** Allowed
-
-**CWD:** Read+write
-
 ### python-dev
 
 ```bash
@@ -694,9 +680,9 @@ nono run --profile rust-dev -- cargo run
 
 ---
 
-## Requesting New Built-in Profiles
+## Requesting New Profiles
 
-If you'd like a built-in profile for a tool not listed here:
+If you'd like a profile for a tool not listed here:
 
 1. Open an issue on the [nono GitHub repository](https://github.com/always-further/nono/issues)
 2. Include:
@@ -705,4 +691,4 @@ If you'd like a built-in profile for a tool not listed here:
    - Network requirements
    - Any special considerations
 
-Built-in profiles are reviewed for security before inclusion.
+Profiles are reviewed for security before inclusion.

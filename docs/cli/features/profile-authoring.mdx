@@ -3,7 +3,7 @@ title: Profile Authoring
 description: Scaffolding, schema validation, and tooling for creating custom profiles
 ---
 
-The `nono profile` command provides scaffolding and tooling for creating custom profiles. Instead of reverse-engineering the JSON structure from built-in profiles, you can generate skeleton files, get editor autocomplete via JSON Schema, and access an LLM-oriented authoring guide.
+The `nono profile` command provides scaffolding and tooling for creating custom profiles. Instead of reverse-engineering the JSON structure from existing profiles, you can generate skeleton files, get editor autocomplete via JSON Schema, and access an LLM-oriented authoring guide.
 
 <Tip>
   For an overview of what profiles are and how they compose with groups, see [Profiles & Groups](/cli/features/profiles-groups).
@@ -118,7 +118,7 @@ With `--full`, additional sections are included as empty stubs for all additive 
 The `init` command validates inputs before writing:
 
 - **Profile name** must be alphanumeric with hyphens (no leading/trailing hyphens)
-- **`--extends`** target must exist as a built-in or user profile
+- **`--extends`** target must exist as a preset, pack, or user profile
 - **`--groups`** are checked against the embedded policy groups
 
 After creating a profile, validate it:
