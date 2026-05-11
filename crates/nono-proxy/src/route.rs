@@ -142,6 +142,8 @@ impl RouteStore {
     pub fn load(routes: &[RouteConfig]) -> Result<Self> {
         let mut loaded = HashMap::new();
 
+        let base_root_store = build_base_root_store();
+
         for route in routes {
             let normalized_prefix = route.prefix.trim_matches('/').to_string();
 
@@ -164,6 +166,7 @@ impl RouteStore {
                     route.tls_client_cert.is_some(),
                 );
                 Some(build_tls_connector(
+                    &base_root_store,
                     route.tls_ca.as_deref(),
                     route.tls_client_cert.as_deref(),
                     route.tls_client_key.as_deref(),
@@ -265,7 +268,8 @@ impl RouteStore {
     #[must_use]
     pub fn lookup_all_by_upstream(&self, host_port: &str) -> Vec<(&str, &LoadedRoute)> {
         let normalised = host_port.to_lowercase();
-        self.routes
+        let mut matches: Vec<_> = self
+            .routes
             .iter()
             .filter(|(_, route)| {
                 route
@@ -274,15 +278,22 @@ impl RouteStore {
                     .is_some_and(|hp| *hp == normalised)
             })
             .map(|(prefix, route)| (prefix.as_str(), route))
-            .collect()
+            .collect();
+        matches.sort_by_key(|(prefix, _)| *prefix);
+        matches
     }
 
     /// Whether any route for `host:port` requires TLS interception.
     #[must_use]
     pub fn has_intercept_route(&self, host_port: &str) -> bool {
-        self.lookup_all_by_upstream(host_port)
-            .iter()
-            .any(|(_, route)| route.requires_intercept)
+        let normalised = host_port.to_lowercase();
+        self.routes.values().any(|route| {
+            route
+                .upstream_host_port
+                .as_ref()
+                .is_some_and(|hp| *hp == normalised)
+                && route.requires_intercept
+        })
     }
 
     /// All unique upstream `host:port` strings across loaded routes.
@@ -360,19 +371,27 @@ fn read_pem_file(path: &std::path::Path, label: &str) -> Result<Zeroizing<Vec<u8
 ///
 /// At least one of the three parameters must be `Some`. Returns an error if any
 /// file cannot be read, contains invalid PEM, or the TLS configuration fails.
+/// Build a root cert store with webpki roots + native system CAs.
+/// Called once at startup and shared across per-route connectors.
+fn build_base_root_store() -> rustls::RootCertStore {
+    let mut store = rustls::RootCertStore::empty();
+    store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let native = rustls_native_certs::load_native_certs();
+    for cert in native.certs {
+        if let Err(e) = store.add(cert) {
+            debug!("skipping unparseable native cert: {e}");
+        }
+    }
+    store
+}
+
 fn build_tls_connector(
+    base_root_store: &rustls::RootCertStore,
     ca_path: Option<&str>,
     client_cert_path: Option<&str>,
     client_key_path: Option<&str>,
 ) -> Result<tokio_rustls::TlsConnector> {
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let native = rustls_native_certs::load_native_certs();
-    for cert in native.certs {
-        if let Err(e) = root_store.add(cert) {
-            debug!("skipping unparseable native cert in route connector: {e}");
-        }
-    }
+    let mut root_store = base_root_store.clone();
 
     // Add custom CA if provided
     if let Some(ca_path) = ca_path {
@@ -497,7 +516,8 @@ fn build_tls_connector(
 /// Compatibility shim: build a connector with only a custom CA (no client cert).
 #[cfg(test)]
 fn build_tls_connector_with_ca(ca_path: &str) -> Result<tokio_rustls::TlsConnector> {
-    build_tls_connector(Some(ca_path), None, None)
+    let base = build_base_root_store();
+    build_tls_connector(&base, Some(ca_path), None, None)
 }
 
 #[cfg(test)]
@@ -1032,7 +1052,8 @@ h56ZLEEqHfVWFhJWIKRSabtxYPV/VJyMv+lo3L0QwSKsouHs3dtF1zVQ
         let cert_path = dir.path().join("client.crt");
         std::fs::write(&cert_path, TEST_CLIENT_CERT_PEM).unwrap();
 
-        let result = build_tls_connector(None, Some(cert_path.to_str().unwrap()), None);
+        let base = build_base_root_store();
+        let result = build_tls_connector(&base, None, Some(cert_path.to_str().unwrap()), None);
         let err = result
             .err()
             .expect("should fail with half-pair")
@@ -1050,7 +1071,8 @@ h56ZLEEqHfVWFhJWIKRSabtxYPV/VJyMv+lo3L0QwSKsouHs3dtF1zVQ
         let key_path = dir.path().join("client.key");
         std::fs::write(&key_path, TEST_CLIENT_KEY_PEM).unwrap();
 
-        let result = build_tls_connector(None, None, Some(key_path.to_str().unwrap()));
+        let base = build_base_root_store();
+        let result = build_tls_connector(&base, None, None, Some(key_path.to_str().unwrap()));
         let err = result
             .err()
             .expect("should fail with half-pair")
@@ -1068,7 +1090,9 @@ h56ZLEEqHfVWFhJWIKRSabtxYPV/VJyMv+lo3L0QwSKsouHs3dtF1zVQ
         let key_path = dir.path().join("client.key");
         std::fs::write(&key_path, TEST_CLIENT_KEY_PEM).unwrap();
 
+        let base = build_base_root_store();
         let result = build_tls_connector(
+            &base,
             None,
             Some("/nonexistent/client.crt"),
             Some(key_path.to_str().unwrap()),
@@ -1087,7 +1111,9 @@ h56ZLEEqHfVWFhJWIKRSabtxYPV/VJyMv+lo3L0QwSKsouHs3dtF1zVQ
         let cert_path = dir.path().join("client.crt");
         std::fs::write(&cert_path, TEST_CLIENT_CERT_PEM).unwrap();
 
+        let base = build_base_root_store();
         let result = build_tls_connector(
+            &base,
             None,
             Some(cert_path.to_str().unwrap()),
             Some("/nonexistent/client.key"),
@@ -1115,7 +1141,9 @@ h56ZLEEqHfVWFhJWIKRSabtxYPV/VJyMv+lo3L0QwSKsouHs3dtF1zVQ
             return;
         }
 
+        let base = build_base_root_store();
         let result = build_tls_connector(
+            &base,
             None,
             Some(cert_path.to_str().unwrap()),
             Some("/nonexistent/key"),
@@ -1136,7 +1164,9 @@ h56ZLEEqHfVWFhJWIKRSabtxYPV/VJyMv+lo3L0QwSKsouHs3dtF1zVQ
         std::fs::write(&cert_path, "not a certificate\n").unwrap();
         std::fs::write(&key_path, TEST_CLIENT_KEY_PEM).unwrap();
 
+        let base = build_base_root_store();
         let result = build_tls_connector(
+            &base,
             None,
             Some(cert_path.to_str().unwrap()),
             Some(key_path.to_str().unwrap()),
@@ -1158,7 +1188,9 @@ h56ZLEEqHfVWFhJWIKRSabtxYPV/VJyMv+lo3L0QwSKsouHs3dtF1zVQ
         std::fs::write(&cert_path, TEST_CLIENT_CERT_PEM).unwrap();
         std::fs::write(&key_path, "not a key\n").unwrap();
 
+        let base = build_base_root_store();
         let result = build_tls_connector(
+            &base,
             None,
             Some(cert_path.to_str().unwrap()),
             Some(key_path.to_str().unwrap()),
