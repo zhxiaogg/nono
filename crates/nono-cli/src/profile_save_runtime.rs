@@ -91,23 +91,10 @@ pub(crate) fn offer_save_run_profile(
         .filter(|name| profile::is_valid_profile_name(name) && profile::is_user_override(name))
     {
         let choice = prompt_profile_save_choice(Some(existing_profile), suppress_patch.is_some())?;
-        let selected_patch = match choice {
-            ProfileSaveChoice::Grant => {
-                if has_overrides
-                    && !confirm_typed_word(
-                        "Granting the shown entries includes policy overrides. Type 'override' to confirm: ",
-                        "override",
-                    )?
-                {
-                    return Ok(());
-                }
-                &patch
-            }
-            ProfileSaveChoice::Suppress => match suppress_patch.as_ref() {
-                Some(patch) => patch,
-                None => return Ok(()),
-            },
-            ProfileSaveChoice::Skip => return Ok(()),
+        let Some(selected_patch) =
+            selected_profile_save_patch(choice, &patch, suppress_patch.as_ref(), has_overrides)?
+        else {
+            return Ok(());
         };
 
         let prepared = prepare_profile_save_from_patch(
@@ -125,23 +112,10 @@ pub(crate) fn offer_save_run_profile(
     }
 
     let choice = prompt_profile_save_choice(None, suppress_patch.is_some())?;
-    let selected_patch = match choice {
-        ProfileSaveChoice::Grant => {
-            if has_overrides
-                && !confirm_typed_word(
-                    "Granting the shown entries includes policy overrides. Type 'override' to confirm: ",
-                    "override",
-                )?
-            {
-                return Ok(());
-            }
-            &patch
-        }
-        ProfileSaveChoice::Suppress => match suppress_patch.as_ref() {
-            Some(patch) => patch,
-            None => return Ok(()),
-        },
-        ProfileSaveChoice::Skip => return Ok(()),
+    let Some(selected_patch) =
+        selected_profile_save_patch(choice, &patch, suppress_patch.as_ref(), has_overrides)?
+    else {
+        return Ok(());
     };
 
     let suggested = suggested_run_profile_name(compared_profile, &cmd_name);
@@ -162,6 +136,29 @@ pub(crate) fn offer_save_run_profile(
     }
 
     Ok(())
+}
+
+fn selected_profile_save_patch<'a>(
+    choice: ProfileSaveChoice,
+    grant_patch: &'a profile::Profile,
+    suppress_patch: Option<&'a profile::Profile>,
+    has_overrides: bool,
+) -> Result<Option<&'a profile::Profile>> {
+    match choice {
+        ProfileSaveChoice::Grant => {
+            if has_overrides
+                && !confirm_typed_word(
+                    "Granting the shown entries includes policy overrides. Type 'override' to confirm: ",
+                    "override",
+                )?
+            {
+                return Ok(None);
+            }
+            Ok(Some(grant_patch))
+        }
+        ProfileSaveChoice::Suppress => Ok(suppress_patch),
+        ProfileSaveChoice::Skip => Ok(None),
+    }
 }
 
 /// Prompt for a new profile name, re-prompting on invalid or shadowed names
@@ -1000,8 +997,9 @@ fn add_patch_grant(
     ignored_denial_paths: &[PathBuf],
 ) {
     let (flag, target) = query_ext::suggested_flag_parts(path, access);
-    if matches_ignored_denial(path, ignored_denial_paths)
-        || matches_ignored_denial(&target, ignored_denial_paths)
+    if !ignored_denial_paths.is_empty()
+        && (matches_ignored_denial(path, ignored_denial_paths)
+            || (target.as_path() != path && matches_ignored_denial(&target, ignored_denial_paths)))
     {
         return;
     }
@@ -1028,6 +1026,10 @@ fn add_patch_grant(
 }
 
 fn matches_ignored_denial(path: &Path, ignored_denial_paths: &[PathBuf]) -> bool {
+    if ignored_denial_paths.is_empty() {
+        return false;
+    }
+
     let canonical = nono::try_canonicalize(path);
     ignored_denial_paths
         .iter()
