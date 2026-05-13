@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Notes
+
+- Socket grant state now records explicit socket scope. New subtree socket
+  grants require this metadata; rolling back to older nono builds may read
+  those state entries as file-scoped grants.
+
 ## [0.54.0] - 2026-05-13
 
 ### Bug Fixes
