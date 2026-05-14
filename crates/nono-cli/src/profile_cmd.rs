@@ -79,12 +79,12 @@ fn cmd_init(args: ProfileInitArgs) -> Result<()> {
 
     // Validate --extends target exists in any of the three sources the
     // resolver knows about (user dir, pack store, built-in).
-    if let Some(ref base) = args.extends {
-        if !profile_exists(base) {
-            return Err(NonoError::ProfileParse(extends_target_not_found_message(
-                base,
-            )));
-        }
+    if let Some(ref base) = args.extends
+        && !profile_exists(base)
+    {
+        return Err(NonoError::ProfileParse(extends_target_not_found_message(
+            base,
+        )));
     }
 
     // Validate --groups against embedded policy
@@ -134,7 +134,7 @@ fn cmd_init(args: ProfileInitArgs) -> Result<()> {
     eprintln!(
         "{} Validate with: nono profile validate {}",
         prefix(),
-        output_path.display()
+        profile_validate_target(&args, &output_path)
     );
     eprintln!(
         "{} For editor autocomplete: nono profile schema -o nono-profile.schema.json",
@@ -142,6 +142,13 @@ fn cmd_init(args: ProfileInitArgs) -> Result<()> {
     );
 
     Ok(())
+}
+
+fn profile_validate_target(args: &ProfileInitArgs, output_path: &Path) -> String {
+    match profile::get_user_profile_path(&args.name) {
+        Ok(default_path) if default_path == output_path => args.name.clone(),
+        _ => output_path.display().to_string(),
+    }
 }
 
 /// Build a skeleton profile JSON value with controlled field ordering.
@@ -215,6 +222,10 @@ fn build_skeleton(args: &ProfileInitArgs) -> serde_json::Value {
             "bypass_protection".to_string(),
             serde_json::Value::Array(vec![]),
         );
+        filesystem.insert(
+            "suppress_save_prompt".to_string(),
+            serde_json::Value::Array(vec![]),
+        );
     }
     root.insert(
         "filesystem".to_string(),
@@ -284,10 +295,10 @@ fn profile_exists(name: &str) -> bool {
     if profile::builtin::get_builtin(name).is_some() {
         return true;
     }
-    if let Ok(path) = profile::get_user_profile_path(name) {
-        if path.exists() {
-            return true;
-        }
+    if let Ok(path) = profile::get_user_profile_path(name)
+        && path.exists()
+    {
+        return true;
     }
     profile::find_pack_store_profile(name).is_some()
 }
@@ -474,19 +485,19 @@ fn cmd_groups_detail(pol: &policy::Policy, name: &str, json: bool) -> Result<()>
         }
     }
 
-    if let Some(ref pairs) = group.symlink_pairs {
-        if !pairs.is_empty() {
-            println!();
-            println!("  {}", theme::fg("symlink_pairs:", t.subtext).bold());
-            let mut sorted: Vec<(&String, &String)> = pairs.iter().collect();
-            sorted.sort_by_key(|(k, _)| k.as_str());
-            for (from, to) in sorted {
-                println!(
-                    "    {} -> {}",
-                    theme::fg(from, t.text),
-                    theme::fg(to, t.subtext)
-                );
-            }
+    if let Some(ref pairs) = group.symlink_pairs
+        && !pairs.is_empty()
+    {
+        println!();
+        println!("  {}", theme::fg("symlink_pairs:", t.subtext).bold());
+        let mut sorted: Vec<(&String, &String)> = pairs.iter().collect();
+        sorted.sort_by_key(|(k, _)| k.as_str());
+        for (from, to) in sorted {
+            println!(
+                "    {} -> {}",
+                theme::fg(from, t.text),
+                theme::fg(to, t.subtext)
+            );
         }
     }
 
@@ -587,10 +598,10 @@ fn group_to_json(name: &str, group: &Group) -> serde_json::Value {
         val["deny"] = serde_json::Value::Object(deny_val);
     }
 
-    if let Some(ref pairs) = group.symlink_pairs {
-        if !pairs.is_empty() {
-            val["symlink_pairs"] = serde_json::json!(pairs);
-        }
+    if let Some(ref pairs) = group.symlink_pairs
+        && !pairs.is_empty()
+    {
+        val["symlink_pairs"] = serde_json::json!(pairs);
     }
 
     val
@@ -720,7 +731,7 @@ pub(crate) fn cmd_list(args: ProfileListArgs) -> Result<()> {
 
     if !pack_entries.is_empty() {
         println!();
-        println!("  {}", theme::fg("Packs:", t.subtext).bold());
+        println!("  {}", theme::fg("Packages:", t.subtext).bold());
         for (name, pack_ref, result) in &pack_entries {
             print_pack_profile_line(name, pack_ref, result, t);
         }
@@ -854,6 +865,16 @@ pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
             println!("    {}", theme::fg(g, t.text));
         }
     }
+    if !profile.groups.exclude.is_empty() {
+        println!();
+        println!(
+            "  {}",
+            theme::fg("Excluded security groups:", t.subtext).bold()
+        );
+        for g in &profile.groups.exclude {
+            println!("    {}", theme::fg(g, t.yellow));
+        }
+    }
 
     if !profile.commands.allow.is_empty() {
         println!();
@@ -863,6 +884,16 @@ pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
         );
         for cmd in &profile.commands.allow {
             println!("    {}", theme::fg(cmd, t.text));
+        }
+    }
+    if !profile.commands.deny.is_empty() {
+        println!();
+        println!(
+            "  {}",
+            theme::fg("Denied commands (deprecated, startup-only):", t.subtext).bold()
+        );
+        for cmd in &profile.commands.deny {
+            println!("    {}", theme::fg(cmd, t.yellow));
         }
     }
 
@@ -892,6 +923,13 @@ pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
             theme::fg(&format!("{policy:?}"), t.text)
         );
     }
+    if let Some(mode) = profile.linux.af_unix_mediation {
+        println!(
+            "  {} {}",
+            theme::fg("Linux AF_UNIX mediation:", t.subtext),
+            theme::fg(&format!("{mode:?}"), t.text)
+        );
+    }
 
     // Filesystem
     let fs = &profile.filesystem;
@@ -902,7 +940,8 @@ pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
         || !fs.read_file.is_empty()
         || !fs.write_file.is_empty()
         || !fs.deny.is_empty()
-        || !fs.bypass_protection.is_empty();
+        || !fs.bypass_protection.is_empty()
+        || !fs.suppress_save_prompt.is_empty();
 
     if has_fs {
         println!();
@@ -914,48 +953,17 @@ pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
         print_fs_paths("read_file", &fs.read_file, t, args.raw);
         print_fs_paths("write_file", &fs.write_file, t, args.raw);
         print_fs_paths("deny", &fs.deny, t, args.raw);
+        print_fs_paths(
+            "suppress_save_prompt",
+            &fs.suppress_save_prompt,
+            t,
+            args.raw,
+        );
         if !fs.bypass_protection.is_empty() {
             println!(
                 "    {}: {}",
                 theme::fg("bypass_protection", t.yellow),
                 fs.bypass_protection.join(", ")
-            );
-        }
-    }
-
-    // Groups/commands (canonical additions)
-    let has_group_settings =
-        !profile.groups.include.is_empty() || !profile.groups.exclude.is_empty();
-    let has_cmd_settings = !profile.commands.allow.is_empty() || !profile.commands.deny.is_empty();
-    if has_group_settings || has_cmd_settings {
-        println!();
-        println!("  {}", theme::fg("Policy patches:", t.subtext).bold());
-        if !profile.groups.include.is_empty() {
-            println!(
-                "    {}: {}",
-                theme::fg("groups.include", t.subtext),
-                profile.groups.include.join(", ")
-            );
-        }
-        if !profile.groups.exclude.is_empty() {
-            println!(
-                "    {}: {}",
-                theme::fg("groups.exclude", t.yellow),
-                profile.groups.exclude.join(", ")
-            );
-        }
-        if !profile.commands.allow.is_empty() {
-            println!(
-                "    {}: {}",
-                theme::fg("commands.allow", t.subtext),
-                profile.commands.allow.join(", ")
-            );
-        }
-        if !profile.commands.deny.is_empty() {
-            println!(
-                "    {}: {}",
-                theme::fg("commands.deny (deprecated, startup-only)", t.yellow),
-                profile.commands.deny.join(", ")
             );
         }
     }
@@ -1158,6 +1166,9 @@ fn profile_to_json(
         security.insert("wsl2_proxy_policy".into(), serde_json::json!(v));
     }
     val["security"] = serde_json::Value::Object(security);
+    if let Some(v) = profile.linux.af_unix_mediation {
+        val["linux"] = serde_json::json!({ "af_unix_mediation": v });
+    }
 
     // Filesystem (canonical schema — `allow`/`read`/`write`/`*_file`/`deny`/
     // `bypass_protection`). Legacy keys deserialize into these fields via
@@ -1171,6 +1182,7 @@ fn profile_to_json(
         "write_file": profile.filesystem.write_file,
         "deny": profile.filesystem.deny,
         "bypass_protection": profile.filesystem.bypass_protection,
+        "suppress_save_prompt": profile.filesystem.suppress_save_prompt,
     });
 
     // Groups and commands are emitted only when populated, so default-empty
@@ -1351,6 +1363,11 @@ pub(crate) fn cmd_diff(args: ProfileDiffArgs) -> Result<()> {
             &p1.filesystem.bypass_protection,
             &p2.filesystem.bypass_protection,
         ),
+        (
+            "filesystem.suppress_save_prompt",
+            &p1.filesystem.suppress_save_prompt,
+            &p2.filesystem.suppress_save_prompt,
+        ),
         ("commands.deny", &p1.commands.deny, &p2.commands.deny),
     ]);
 
@@ -1380,6 +1397,12 @@ pub(crate) fn cmd_diff(args: ProfileDiffArgs) -> Result<()> {
         "wsl2_proxy_policy",
         &p1.security.wsl2_proxy_policy.map(|v| format!("{v:?}")),
         &p2.security.wsl2_proxy_policy.map(|v| format!("{v:?}")),
+        t,
+    );
+    any_diff |= diff_scalar_option(
+        "linux.af_unix_mediation",
+        &p1.linux.af_unix_mediation.map(|v| format!("{v:?}")),
+        &p2.linux.af_unix_mediation.map(|v| format!("{v:?}")),
         t,
     );
     any_diff |= diff_scalar_option(
@@ -1827,10 +1850,10 @@ fn diff_scalar_option(
     }
     println!();
     println!("  {}:", theme::fg(label, t.subtext).bold());
-    if let Some(ref old) = v1 {
+    if let Some(old) = v1 {
         println!("    {}", theme::fg(&format!("- {old}"), t.red));
     }
-    if let Some(ref new) = v2 {
+    if let Some(new) = v2 {
         println!("    {}", theme::fg(&format!("+ {new}"), t.green));
     }
     true
@@ -1892,6 +1915,13 @@ fn diff_to_json(name1: &str, name2: &str, p1: &Profile, p2: &Profile) -> serde_j
             "profile1": p1.security.wsl2_proxy_policy,
             "profile2": p2.security.wsl2_proxy_policy,
             "changed": p1.security.wsl2_proxy_policy != p2.security.wsl2_proxy_policy,
+        },
+        "linux": {
+            "af_unix_mediation": {
+                "profile1": p1.linux.af_unix_mediation,
+                "profile2": p2.linux.af_unix_mediation,
+                "changed": p1.linux.af_unix_mediation != p2.linux.af_unix_mediation,
+            }
         },
         "filesystem": diff_fs_json(&p1.filesystem, &p2.filesystem),
         "workdir": {
@@ -1989,6 +2019,10 @@ fn diff_fs_json(
         "allow_file": diff_vec(&fs1.allow_file, &fs2.allow_file),
         "read_file": diff_vec(&fs1.read_file, &fs2.read_file),
         "write_file": diff_vec(&fs1.write_file, &fs2.write_file),
+        "suppress_save_prompt": diff_vec(
+            &fs1.suppress_save_prompt,
+            &fs2.suppress_save_prompt
+        ),
     })
 }
 
@@ -2162,12 +2196,12 @@ fn resolve_validate_target(input: &std::path::Path) -> std::path::PathBuf {
     if name.contains('/') || name.ends_with(".json") {
         return input.to_path_buf();
     }
-    if let Ok(p) = profile::get_user_profile_path(name) {
-        if p.exists() {
-            return p;
-        }
+    if let Ok(p) = profile::get_user_profile_path(name)
+        && p.exists()
+    {
+        return p;
     }
-    if let Some(p) = profile::find_pack_store_profile(name) {
+    if let Some((p, _)) = profile::find_pack_store_profile(name) {
         return p;
     }
     input.to_path_buf()
@@ -2254,6 +2288,11 @@ pub(crate) fn cmd_validate(args: ProfileValidateArgs) -> Result<()> {
         check_paths(&profile.filesystem.allow, "filesystem.allow", &mut warnings);
         check_paths(&profile.filesystem.read, "filesystem.read", &mut warnings);
         check_paths(&profile.filesystem.write, "filesystem.write", &mut warnings);
+        check_paths(
+            &profile.filesystem.suppress_save_prompt,
+            "filesystem.suppress_save_prompt",
+            &mut warnings,
+        );
     }
 
     if args.json {
@@ -2388,14 +2427,14 @@ pub(crate) fn cmd_promote(args: ProfilePromoteArgs) -> Result<()> {
         None
     };
 
-    if current_bytes.is_none() {
-        if let Some(source) = reserved_profile_source(&args.name)? {
-            return Err(NonoError::ProfileParse(format!(
-                "refusing to promote '{}' because it would shadow a {source} profile. \
+    if current_bytes.is_none()
+        && let Some(source) = reserved_profile_source(&args.name)?
+    {
+        return Err(NonoError::ProfileParse(format!(
+            "refusing to promote '{}' because it would shadow a {source} profile. \
                  Draft a derived profile such as '{}-local' with \"extends\": \"{}\" instead.",
-                args.name, args.name, args.name
-            )));
-        }
+            args.name, args.name, args.name
+        )));
     }
 
     if let Some(current) = current_bytes.as_deref() {
@@ -3181,6 +3220,61 @@ mod tests {
     }
 
     #[test]
+    fn profile_validate_target_prefers_name_for_default_user_profile_path() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let xdg = dir.path().join("config");
+        std::fs::create_dir_all(&xdg).expect("create xdg");
+        let xdg_str = xdg.to_str().expect("utf8 xdg");
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("XDG_CONFIG_HOME", xdg_str)]);
+
+        let args = ProfileInitArgs {
+            name: "copilot".to_string(),
+            extends: None,
+            groups: vec![],
+            description: None,
+            full: false,
+            output: None,
+            force: false,
+        };
+        let output_path = profile::get_user_profile_path("copilot").expect("profile path");
+
+        assert_eq!(profile_validate_target(&args, &output_path), "copilot");
+    }
+
+    #[test]
+    fn profile_validate_target_uses_path_for_custom_output() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let xdg = dir.path().join("config");
+        std::fs::create_dir_all(&xdg).expect("create xdg");
+        let xdg_str = xdg.to_str().expect("utf8 xdg");
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("XDG_CONFIG_HOME", xdg_str)]);
+
+        let output_path = dir.path().join("custom-copilot.json");
+        let args = ProfileInitArgs {
+            name: "copilot".to_string(),
+            extends: None,
+            groups: vec![],
+            description: None,
+            full: false,
+            output: Some(output_path.clone()),
+            force: false,
+        };
+
+        assert_eq!(
+            profile_validate_target(&args, &output_path),
+            output_path.display().to_string()
+        );
+    }
+
+    #[test]
     fn test_force_overwrite() {
         use std::io::Write;
 
@@ -3284,6 +3378,7 @@ mod tests {
         assert!(full_fs.contains_key("write_file"));
         assert!(full_fs.contains_key("deny"));
         assert!(full_fs.contains_key("bypass_protection"));
+        assert!(full_fs.contains_key("suppress_save_prompt"));
 
         // Minimal filesystem has only allow + read; the canonical deny /
         // bypass_protection appear only with --full.
@@ -3292,6 +3387,7 @@ mod tests {
         assert!(!min_fs.contains_key("allow_file"));
         assert!(!min_fs.contains_key("deny"));
         assert!(!min_fs.contains_key("bypass_protection"));
+        assert!(!min_fs.contains_key("suppress_save_prompt"));
 
         // Full groups has both include and exclude; minimal has only include.
         let full_groups = full_obj["groups"].as_object().expect("groups object");

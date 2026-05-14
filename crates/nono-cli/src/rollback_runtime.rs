@@ -1,7 +1,7 @@
-use crate::audit_attestation::{write_audit_attestation, AuditSigner};
+use crate::audit_attestation::{AuditSigner, write_audit_attestation};
 use crate::audit_integrity::AuditRecorder;
 use crate::audit_ledger;
-use crate::launch_runtime::{rollback_base_exclusions, RollbackLaunchOptions};
+use crate::launch_runtime::{RollbackLaunchOptions, rollback_base_exclusions};
 use crate::{config, output, rollback_preflight, rollback_session, rollback_ui};
 use nono::undo::ExecutableIdentity;
 use nono::{AccessMode, CapabilitySet, Result};
@@ -36,10 +36,13 @@ pub(crate) struct RollbackExitContext<'a> {
     pub(crate) audit_snapshot_state: Option<AuditSnapshotState>,
     pub(crate) audit_tracked_paths: Vec<PathBuf>,
     pub(crate) audit_recorder: Option<&'a Mutex<AuditRecorder>>,
+    pub(crate) supervisor_network_audit_events:
+        Option<&'a Mutex<Vec<nono::undo::NetworkAuditEvent>>>,
     pub(crate) audit_integrity_enabled: bool,
     pub(crate) proxy_handle: Option<&'a nono_proxy::server::ProxyHandle>,
     pub(crate) executable_identity: Option<&'a ExecutableIdentity>,
     pub(crate) audit_signer: Option<&'a AuditSigner>,
+    pub(crate) redaction_policy: &'a nono::ScrubPolicy,
     pub(crate) started: &'a str,
     pub(crate) ended: &'a str,
     pub(crate) command: &'a [String],
@@ -459,10 +462,12 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<(
         audit_snapshot_state,
         audit_tracked_paths,
         audit_recorder,
+        supervisor_network_audit_events,
         audit_integrity_enabled,
         proxy_handle,
         executable_identity,
         audit_signer,
+        redaction_policy,
         started,
         ended,
         command,
@@ -475,6 +480,12 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<(
         Vec::new,
         nono_proxy::server::ProxyHandle::drain_audit_events,
     );
+    if let Some(events_mutex) = supervisor_network_audit_events {
+        let mut supervisor_events = events_mutex.lock().map_err(|_| {
+            nono::NonoError::Snapshot("Network audit event lock poisoned".to_string())
+        })?;
+        network_events.extend(supervisor_events.drain(..));
+    }
     let (audit_event_count, audit_integrity) = if let Some(recorder_mutex) = audit_recorder {
         let mut recorder = recorder_mutex
             .lock()
@@ -494,6 +505,7 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<(
         (0, None)
     };
 
+    let scrubbed_command = nono::scrub_argv_with_policy(command, redaction_policy);
     let mut audit_saved = false;
 
     if let Some(RollbackRuntimeState {
@@ -512,7 +524,7 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<(
             session_id: rb_session_id,
             started: started.to_string(),
             ended: Some(ended.to_string()),
-            command: command.to_vec(),
+            command: scrubbed_command.clone(),
             executable_identity: executable_identity.cloned(),
             tracked_paths,
             snapshot_count: manager.snapshot_count(),
@@ -528,6 +540,7 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<(
                 attestation_session_dir(&session_dir, audit_state),
                 &meta,
                 signer,
+                redaction_policy,
             )?);
         }
         manager.save_session_metadata(&meta)?;
@@ -548,40 +561,39 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<(
         let _ = manager.cleanup_new_atomic_temp_files(&atomic_temp_before);
     }
 
-    if !audit_saved {
-        if let Some(audit_state) = audit_state {
-            let (tracked_paths, merkle_roots) = match audit_snapshot_state {
-                Some(snap) => {
-                    let final_root = snap.manager.compute_merkle_root()?;
-                    (snap.tracked_paths, vec![snap.baseline_root, final_root])
-                }
-                None => (audit_tracked_paths, Vec::new()),
-            };
-            let mut meta = nono::undo::SessionMetadata {
-                session_id: audit_state.session_id.clone(),
-                started: started.to_string(),
-                ended: Some(ended.to_string()),
-                command: command.to_vec(),
-                executable_identity: executable_identity.cloned(),
-                tracked_paths,
-                snapshot_count: 0,
-                exit_code: Some(exit_code),
-                merkle_roots,
-                network_events,
-                audit_event_count,
-                audit_integrity,
-                audit_attestation: None,
-            };
-            if let Some(signer) = audit_signer {
-                meta.audit_attestation = Some(write_audit_attestation(
-                    &audit_state.session_dir,
-                    &meta,
-                    signer,
-                )?);
+    if !audit_saved && let Some(audit_state) = audit_state {
+        let (tracked_paths, merkle_roots) = match audit_snapshot_state {
+            Some(snap) => {
+                let final_root = snap.manager.compute_merkle_root()?;
+                (snap.tracked_paths, vec![snap.baseline_root, final_root])
             }
-            nono::undo::SnapshotManager::write_session_metadata(&audit_state.session_dir, &meta)?;
-            audit_ledger::append_session(&meta)?;
+            None => (audit_tracked_paths, Vec::new()),
+        };
+        let mut meta = nono::undo::SessionMetadata {
+            session_id: audit_state.session_id.clone(),
+            started: started.to_string(),
+            ended: Some(ended.to_string()),
+            command: scrubbed_command,
+            executable_identity: executable_identity.cloned(),
+            tracked_paths,
+            snapshot_count: 0,
+            exit_code: Some(exit_code),
+            merkle_roots,
+            network_events,
+            audit_event_count,
+            audit_integrity,
+            audit_attestation: None,
+        };
+        if let Some(signer) = audit_signer {
+            meta.audit_attestation = Some(write_audit_attestation(
+                &audit_state.session_dir,
+                &meta,
+                signer,
+                redaction_policy,
+            )?);
         }
+        nono::undo::SnapshotManager::write_session_metadata(&audit_state.session_dir, &meta)?;
+        audit_ledger::append_session(&meta)?;
     }
 
     Ok(())
@@ -592,10 +604,10 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<(
 mod tests {
     use super::*;
     use crate::audit_attestation::{
-        signer_from_key_pair, verify_audit_attestation, write_audit_attestation,
-        AUDIT_ATTESTATION_BUNDLE_FILENAME,
+        AUDIT_ATTESTATION_BUNDLE_FILENAME, signer_from_key_pair, verify_audit_attestation,
+        write_audit_attestation,
     };
-    use crate::test_env::{EnvVarGuard, ENV_LOCK};
+    use crate::test_env::{ENV_LOCK, EnvVarGuard};
     use nono::trust;
     use nono::undo::{AuditIntegritySummary, SessionMetadata};
     use nono::{CapabilitySet, CapabilitySource, FsCapability};
@@ -870,15 +882,18 @@ mod tests {
             ),
             &metadata,
             &signer,
+            &nono::ScrubPolicy::secure_default(),
         )
         .expect("write attestation");
 
         let mut attested_metadata = metadata.clone();
         attested_metadata.audit_attestation = Some(summary);
 
-        assert!(!rollback_dir
-            .join(AUDIT_ATTESTATION_BUNDLE_FILENAME)
-            .exists());
+        assert!(
+            !rollback_dir
+                .join(AUDIT_ATTESTATION_BUNDLE_FILENAME)
+                .exists()
+        );
         assert!(audit_dir.join(AUDIT_ATTESTATION_BUNDLE_FILENAME).exists());
 
         let verification =

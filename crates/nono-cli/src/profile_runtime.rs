@@ -9,6 +9,8 @@ pub(crate) struct PreparedProfile {
     pub(crate) capability_elevation: bool,
     #[cfg(target_os = "linux")]
     pub(crate) wsl2_proxy_policy: profile::Wsl2ProxyPolicy,
+    #[cfg(target_os = "linux")]
+    pub(crate) af_unix_mediation: profile::LinuxAfUnixMediation,
     pub(crate) workdir_access: Option<profile::WorkdirAccess>,
     pub(crate) rollback_exclude_patterns: Vec<String>,
     pub(crate) rollback_exclude_globs: Vec<String>,
@@ -25,7 +27,9 @@ pub(crate) struct PreparedProfile {
     pub(crate) allow_gpu: bool,
     pub(crate) allow_parent_of_protected: bool,
     pub(crate) bypass_protection_paths: Vec<PathBuf>,
+    pub(crate) ignored_denial_paths: Vec<PathBuf>,
     pub(crate) allowed_env_vars: Option<Vec<String>>,
+    pub(crate) denied_env_vars: Option<Vec<String>>,
 }
 
 #[derive(Clone, Copy)]
@@ -123,11 +127,42 @@ fn verify_profile_packs(packs: &[String]) -> crate::Result<()> {
 
         let bundle_path = install_dir.join(".nono-trust.bundle");
         if bundle_path.exists() {
-            verify_stored_bundles(&install_dir, &bundle_path, pack_ref)?;
+            // A trust bundle without a lockfile provenance record means we
+            // cannot verify who signed it. Fail hard rather than silently
+            // accepting any valid Sigstore signer.
+            let pinned_signer = match locked {
+                None => {
+                    return Err(nono::NonoError::PackageVerification {
+                        package: pack_ref.clone(),
+                        reason: format!(
+                            "pack '{}' has a trust bundle but no lockfile entry — \
+                             reinstall with: nono pull {} --force",
+                            pack_ref, pack_ref
+                        ),
+                    });
+                }
+                Some(pkg) => pkg
+                    .provenance
+                    .as_ref()
+                    .map(|p| p.signer_identity.as_str())
+                    .ok_or_else(|| nono::NonoError::PackageVerification {
+                        package: pack_ref.clone(),
+                        reason: format!(
+                            "pack '{}' has a trust bundle but no signer identity in the \
+                             lockfile — reinstall with: nono pull {} --force",
+                            pack_ref, pack_ref
+                        ),
+                    })?,
+            };
+            verify_stored_bundles(&install_dir, &bundle_path, pack_ref, Some(pinned_signer))?;
         }
     }
 
     Ok(())
+}
+
+fn canonical_signer(uri: &str) -> &str {
+    uri.rsplit_once('@').map_or(uri, |(prefix, _)| prefix)
 }
 
 /// Re-verify each artifact's Sigstore bundle from the stored trust bundle file.
@@ -135,6 +170,7 @@ fn verify_stored_bundles(
     install_dir: &Path,
     bundle_path: &Path,
     pack_ref: &str,
+    pinned_signer: Option<&str>,
 ) -> crate::Result<()> {
     let bundle_content = std::fs::read_to_string(bundle_path).map_err(|e| {
         nono::NonoError::PackageInstall(format!(
@@ -210,6 +246,36 @@ fn verify_stored_bundles(
                 artifact_name, pack_ref, e, pack_ref
             ))
         })?;
+
+        // Check the verified signer identity against the lockfile pin.
+        // All artifacts in a pack share the same signer, so we check on each
+        // entry and fail fast on any mismatch.
+        if let Some(pinned) = pinned_signer {
+            let identity = nono::trust::extract_signer_identity(&bundle, Path::new(artifact_name))?;
+            let verified_uri = match &identity {
+                nono::trust::SignerIdentity::Keyless {
+                    repository,
+                    workflow,
+                    git_ref,
+                    ..
+                } => format!("https://github.com/{repository}/{workflow}@{git_ref}"),
+                nono::trust::SignerIdentity::Keyed { key_id } => {
+                    format!("keyed:{key_id}")
+                }
+            };
+            // Strip @<git_ref> for canonical comparison — we pin repo+workflow,
+            // not the specific tag that triggered each release.
+            if canonical_signer(verified_uri.as_str()) != canonical_signer(pinned) {
+                return Err(nono::NonoError::PackageVerification {
+                    package: pack_ref.to_string(),
+                    reason: format!(
+                        "signer identity mismatch for '{}': bundle was signed by '{}' \
+                         but lockfile pins '{}'. Reinstall with: nono pull {} --force",
+                        artifact_name, verified_uri, pinned, pack_ref
+                    ),
+                });
+            }
+        }
     }
 
     Ok(())
@@ -261,6 +327,42 @@ fn collect_bypass_protection_paths(
     paths
 }
 
+fn expand_ignored_denial_path(path: &Path, workdir: &Path) -> PathBuf {
+    let path_str = path.to_string_lossy();
+    let expanded = profile::expand_vars(&path_str, workdir).unwrap_or_else(|_| path.to_path_buf());
+    nono::try_canonicalize(&expanded)
+}
+
+fn collect_ignored_denial_paths(
+    loaded_profile: Option<&profile::Profile>,
+    cli_ignored_denials: &[PathBuf],
+    workdir: &Path,
+) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = loaded_profile
+        .map(|profile| {
+            profile
+                .filesystem
+                .suppress_save_prompt
+                .iter()
+                .filter_map(|template| {
+                    profile::expand_vars(template, workdir)
+                        .ok()
+                        .map(|expanded| nono::try_canonicalize(&expanded))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    for path in cli_ignored_denials {
+        let canonical = expand_ignored_denial_path(path, workdir);
+        if !paths.contains(&canonical) {
+            paths.push(canonical);
+        }
+    }
+
+    paths
+}
+
 fn prepare_profile_with_options(
     args: &SandboxArgs,
     workdir: &Path,
@@ -290,10 +392,30 @@ fn prepare_profile_with_options(
             Some(profile_name),
             options.hook_output_silent,
         )?;
-        verify_profile_packs(&profile.packs)?;
+        // If the profile was addressed by pack ref (e.g. --profile always-further/hermes),
+        // ensure that pack is verified even if the profile JSON doesn't list it in `packs`.
+        // Pack refs are injected into profile.packs at load time for every
+        // pack-store resolution — both direct registry refs and name/alias
+        // paths — so no post-hoc lookup is needed here.
+        let mut packs_to_verify = profile.packs.clone();
 
-        if !profile.packs.is_empty() && !options.hook_output_silent {
-            eprintln!("  Verified {} pack(s)", profile.packs.len());
+        // For direct registry refs the pack key may not yet be in packs if
+        // load_registry_profile found the pack installed but the profile JSON
+        // predates the injection convention. Guard with a fallback.
+        if profile::is_registry_ref(profile_name) {
+            let key = profile_name
+                .split_once('@')
+                .map_or(profile_name.as_str(), |(p, _)| p)
+                .to_string();
+            if !packs_to_verify.contains(&key) {
+                packs_to_verify.push(key);
+            }
+        }
+
+        verify_profile_packs(&packs_to_verify)?;
+
+        if !packs_to_verify.is_empty() && !options.hook_output_silent {
+            eprintln!("  Verified {} pack(s)", packs_to_verify.len());
         }
 
         if options.install_hooks {
@@ -313,6 +435,11 @@ fn prepare_profile_with_options(
         wsl2_proxy_policy: loaded_profile
             .as_ref()
             .and_then(|profile| profile.security.wsl2_proxy_policy)
+            .unwrap_or_default(),
+        #[cfg(target_os = "linux")]
+        af_unix_mediation: loaded_profile
+            .as_ref()
+            .and_then(|profile| profile.linux.af_unix_mediation)
             .unwrap_or_default(),
         workdir_access: loaded_profile
             .as_ref()
@@ -381,14 +508,34 @@ fn prepare_profile_with_options(
             &args.bypass_protection,
             workdir,
         ),
+        ignored_denial_paths: collect_ignored_denial_paths(
+            loaded_profile.as_ref(),
+            &args.suppress_save_prompt,
+            workdir,
+        ),
         allowed_env_vars: loaded_profile.as_ref().and_then(|profile| {
             profile.environment.as_ref().map(|env_config| {
-                if let Some(err) =
-                    crate::exec_strategy::validate_allow_vars_pattern(&env_config.allow_vars)
-                {
+                if let Some(err) = crate::exec_strategy::validate_env_var_patterns(
+                    &env_config.allow_vars,
+                    "allow_vars",
+                ) {
                     eprintln!("Warning: {}", err);
                 }
                 env_config.allow_vars.clone()
+            })
+        }),
+        denied_env_vars: loaded_profile.as_ref().and_then(|profile| {
+            profile.environment.as_ref().and_then(|env_config| {
+                if env_config.deny_vars.is_empty() {
+                    return None;
+                }
+                if let Some(err) = crate::exec_strategy::validate_env_var_patterns(
+                    &env_config.deny_vars,
+                    "deny_vars",
+                ) {
+                    eprintln!("Warning: {}", err);
+                }
+                Some(env_config.deny_vars.clone())
             })
         }),
         loaded_profile,
@@ -440,6 +587,10 @@ mod tests {
         if let Err(err) = fs::create_dir_all(&cli_override) {
             panic!("failed to create CLI override path: {err}");
         }
+        let cli_ignore = workdir.path().join("cli-ignore");
+        if let Err(err) = fs::create_dir_all(&cli_ignore) {
+            panic!("failed to create CLI ignore path: {err}");
+        }
 
         let profile_path = workdir.path().join("preflight-profile.json");
         if let Err(err) = fs::write(
@@ -455,7 +606,8 @@ mod tests {
                     "listen_port": [8080]
                 },
                 "filesystem": {
-                    "bypass_protection": ["$WORKDIR/.git"]
+                    "bypass_protection": ["$WORKDIR/.git"],
+                    "suppress_save_prompt": ["$WORKDIR/.copilot/settings.json"]
                 }
             }"#,
         ) {
@@ -465,6 +617,7 @@ mod tests {
         let args = SandboxArgs {
             profile: Some(profile_path.to_string_lossy().into_owned()),
             bypass_protection: vec![cli_override],
+            suppress_save_prompt: vec![cli_ignore],
             ..SandboxArgs::default()
         };
 
@@ -510,6 +663,21 @@ mod tests {
             runtime.bypass_protection_paths,
             preflight.bypass_protection_paths
         );
+        assert_eq!(runtime.ignored_denial_paths, preflight.ignored_denial_paths);
+        assert!(
+            runtime
+                .ignored_denial_paths
+                .contains(&nono::try_canonicalize(
+                    &workdir.path().join(".copilot/settings.json")
+                ))
+        );
+        assert!(
+            runtime
+                .ignored_denial_paths
+                .contains(&nono::try_canonicalize(&workdir.path().join("cli-ignore")))
+        );
+        assert_eq!(runtime.allowed_env_vars, preflight.allowed_env_vars);
+        assert_eq!(runtime.denied_env_vars, preflight.denied_env_vars);
         assert_eq!(
             runtime.loaded_profile.as_ref().map(|profile| {
                 (

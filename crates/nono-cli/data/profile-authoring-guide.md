@@ -101,6 +101,7 @@ All filesystem grants, denials, and deny-rule exemptions live under this single 
 | `write_file`        | array of string | Single files with write-only access. |
 | `deny`              | array of string | Paths denied filesystem access. |
 | `bypass_protection` | array of string | Paths exempted from deny groups. **This flag does not implicitly grant access** — `bypass_protection` only removes the deny rule; each path must also appear in `filesystem.allow`, `filesystem.read`, or `filesystem.write` (or the matching `*_file` variant) to become accessible. |
+| `ignore`            | array of string | Paths whose runtime denials should not be offered in save-profile prompts. Does not grant access or hide diagnostics. |
 
 All path fields support variable expansion (see Section 6).
 
@@ -145,7 +146,7 @@ Define a custom reverse proxy credential route for services not in `network-poli
 | Field               | Type            | Required    | Description |
 |---------------------|-----------------|-------------|-------------|
 | `upstream`          | string          | yes         | Upstream URL. Must be HTTPS (HTTP only for loopback). |
-| `credential_key`    | string          | yes         | Keystore account name, `op://` URI, `apple-password://` URI, or `file://` URI. |
+| `credential_key`    | string          | yes         | Keystore account name, `op://` URI, `apple-password://` URI, `file://` URI, or `env://` URI. |
 | `inject_mode`       | string          | no          | One of: `"header"` (default), `"url_path"`, `"query_param"`, `"basic_auth"`. |
 | `inject_header`     | string          | header mode | HTTP header name. Default: `"Authorization"`. |
 | `credential_format` | string          | header mode | Format string with `{}` placeholder. Default: `"Bearer {}"`. |
@@ -153,7 +154,7 @@ Define a custom reverse proxy credential route for services not in `network-poli
 | `path_replacement`  | string          | url_path    | Replacement pattern. Defaults to `path_pattern`. |
 | `query_param_name`  | string          | query_param | Query parameter name for credential injection. |
 | `proxy`             | object          | no          | Optional proxy-side overrides for phantom token parsing. Omitted fields inherit from top-level values. |
-| `env_var`           | string          | URI keys    | Environment variable name for SDK API key. Required when `credential_key` is a URI. |
+| `env_var`           | string          | URI keys    | Environment variable name for SDK API key. Required when `credential_key` is `op://`, `apple-password://`, or `file://`. Optional for `env://`. |
 | `endpoint_rules`    | array           | no          | L7 allow-list of `{"method": "GET", "path": "/**"}` rules. When non-empty, only matching requests are forwarded (default-deny). |
 | `tls_ca`            | string (path)   | no          | Path to a PEM-encoded CA certificate. Use for upstreams with self-signed or private CA certs (e.g. a Kubernetes API server). |
 | `tls_client_cert`   | string (path)   | no          | Path to a PEM-encoded client certificate for mutual TLS (mTLS). Must be set together with `tls_client_key`. |
@@ -337,6 +338,29 @@ When a deny group blocks a path you need access to, use `filesystem.bypass_prote
 }
 ```
 
+### Suppress repeated save suggestions
+
+Use `filesystem.suppress_save_prompt` for paths you intentionally do not want
+to grant, but also do not want offered in the save-profile prompt every run:
+
+```json
+{
+  "extends": "default",
+  "meta": {
+    "name": "copilot-local",
+    "description": "Local prompt-suppression choices"
+  },
+  "filesystem": {
+    "suppress_save_prompt": ["$HOME/.copilot/settings.json"]
+  }
+}
+```
+
+The sandbox still denies these paths. `filesystem.suppress_save_prompt` only
+filters the save-profile suggestion. `filesystem.ignore` is accepted as an
+alias, but new profiles should use the explicit suppress name so it is not
+mistaken for an access grant.
+
 ### Denying specific project files
 
 Block access to a file in the working directory while keeping the rest accessible. Use `$WORKDIR` to reference the current working directory — relative paths like `./` are not expanded:
@@ -475,7 +499,7 @@ nono profile diff <a> <b>         # Compare two profiles
 
 ## 6. Variable Expansion
 
-The following variables are expanded in all path fields (`filesystem.*`, including `filesystem.allow`, `filesystem.read`, `filesystem.write`, `filesystem.deny`, and `filesystem.bypass_protection`).
+The following variables are expanded in all path fields (`filesystem.*`, including `filesystem.allow`, `filesystem.read`, `filesystem.write`, `filesystem.deny`, `filesystem.bypass_protection`, and `filesystem.suppress_save_prompt`).
 
 | Variable           | Expands to |
 |--------------------|------------|
@@ -491,17 +515,46 @@ The following variables are expanded in all path fields (`filesystem.*`, includi
 
 Always use these variables instead of hardcoded absolute paths to keep profiles portable across machines and users.
 
-## 7. Key Rules
+## 7. Platform Predicates
+
+Profile entries that list paths, group names, URL origins, or env credentials can be unconditional strings or conditional objects with `when`.
+
+```json
+{
+  "groups": {
+    "include": [
+      "agent_common",
+      { "name": "agent_linux", "when": "linux" },
+      { "name": "agent_macos", "when": "macos" }
+    ]
+  },
+  "filesystem": {
+    "read": [
+      "$HOME/.agent",
+      { "path": "$HOME/Library/Application Support/Agent", "when": "macos" },
+      { "path": "$XDG_CONFIG_HOME/agent", "when": "linux" }
+    ]
+  },
+  "env_credentials": {
+    "agent_key": { "env_var": "AGENT_API_KEY", "when": ["linux", "macos:>=15"] }
+  }
+}
+```
+
+Supported predicate forms include `linux`, `macos`, `linux:fedora`, `linux:rhel-like`, `linux:ubuntu:>=24.04`, `macos:>=15`, negation such as `!linux:nixos`, and arrays for any-of matching.
+
+## 8. Key Rules
 
 - A profile with no `groups.include` has no deny rules. Always include appropriate deny groups for untrusted workloads.
 - `filesystem.bypass_protection` only removes the deny rule. It does not grant access. You must also add the path via `filesystem.allow`, `filesystem.read`, or `filesystem.write` (or the matching `*_file` variant).
+- `filesystem.suppress_save_prompt` only suppresses save-profile suggestions. It does not grant access, remove deny rules, or hide diagnostics.
 - `groups.exclude` removes groups from the resolved set. This weakens the sandbox. Use it only when you understand which protections you are removing.
 - `extends` chains resolve recursively up to depth 10. Circular inheritance is an error.
-- Platform-specific groups (suffix `_macos` or `_linux`) are filtered at resolution time. Include both variants for cross-platform profiles.
+- Prefer `when` predicates for package-specific platform differences. Put shared OS baseline paths in built-in policy groups instead.
 - `network.block: true` blocks all network access. It cannot be combined with proxy settings.
 - `custom_credentials` upstream URLs must use HTTPS. HTTP is only accepted for loopback addresses (localhost, 127.0.0.1, ::1).
 
-## 8. Migration from previous schema
+## 9. Migration from previous schema
 
 Issue [#594](https://github.com/always-further/nono/issues/594) restructured the profile JSON schema. The old `policy.*` namespace has been dissolved into `filesystem`, `groups`, and `commands`; `security.groups` and `security.allowed_commands` have moved to top-level `groups.include` and `commands.allow`.
 

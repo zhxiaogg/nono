@@ -3,7 +3,7 @@
 //! All colors are drawn from the active theme via `theme::current()`.
 
 use crate::command_display::format_command_line;
-use crate::theme::{self, badge, fg, Rgb};
+use crate::theme::{self, Rgb, badge, fg};
 use colored::Colorize;
 use nono::{AccessMode, CapabilitySet, NetworkMode, NonoError, Result};
 use std::ffi::{OsStr, OsString};
@@ -127,10 +127,10 @@ pub fn print_capabilities(caps: &CapabilitySet, verbose: u8, silent: bool) {
 
         for cap in &user_caps {
             let mode_badge = format_unix_socket_mode_badge(cap.mode);
-            let scope_suffix = if cap.is_directory {
-                "  (directory grant — sockets inside only, non-recursive)"
-            } else {
-                ""
+            let scope_suffix = match cap.scope {
+                nono::SocketScope::File => "",
+                nono::SocketScope::DirChildren => "  (directory grant — direct child sockets only)",
+                nono::SocketScope::DirSubtree => "  (subtree grant — recursive socket paths)",
             };
             if verbose > 0 {
                 let source_str = format!("{}", cap.source);
@@ -323,6 +323,89 @@ pub fn print_abi_info(silent: bool) {
     }
 }
 
+/// Print the Landlock scope policy derived from the current capabilities.
+#[cfg(target_os = "linux")]
+pub fn print_landlock_scope_policy(caps: &CapabilitySet, verbose: u8, silent: bool) {
+    if silent || verbose == 0 {
+        return;
+    }
+
+    let t = theme::current();
+    match nono::landlock_scope_policy(caps) {
+        Ok(policy) => {
+            eprintln!(
+                "  {} {}",
+                badge(" scope ", t.blue, BADGE_FG_DARK),
+                fg(
+                    &format!("Landlock {} detected", policy.abi_version),
+                    t.subtext,
+                )
+            );
+            eprintln!(
+                "          {} {}",
+                fg("signal:", t.subtext),
+                fg(
+                    &format_scope_status(
+                        policy.signal_requested,
+                        policy.signal_enforced,
+                        policy.scoping_supported,
+                    ),
+                    scope_status_color(
+                        policy.signal_requested,
+                        policy.signal_enforced,
+                        policy.scoping_supported,
+                        t,
+                    ),
+                )
+            );
+            eprintln!(
+                "          {} {}",
+                fg("abstract-unix-socket:", t.subtext),
+                fg(
+                    &format_scope_status(
+                        policy.abstract_unix_socket_requested,
+                        policy.abstract_unix_socket_enforced,
+                        policy.scoping_supported,
+                    ),
+                    scope_status_color(
+                        policy.abstract_unix_socket_requested,
+                        policy.abstract_unix_socket_enforced,
+                        policy.scoping_supported,
+                        t,
+                    ),
+                )
+            );
+        }
+        Err(err) => {
+            eprintln!(
+                "  {} {}",
+                badge(" scope ", t.red, BADGE_FG_DARK),
+                fg(&format!("Landlock scope policy unavailable: {err}"), t.red),
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn format_scope_status(requested: bool, enforced: bool, supported: bool) -> String {
+    match (requested, enforced, supported) {
+        (true, true, _) => "requested, enforced".to_string(),
+        (true, false, false) => "requested, unsupported by detected ABI".to_string(),
+        (true, false, true) => "requested, not enforced".to_string(),
+        (false, _, true) => "not requested".to_string(),
+        (false, _, false) => "not requested; detected ABI has no scope support".to_string(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn scope_status_color(requested: bool, enforced: bool, supported: bool, t: &theme::Theme) -> Rgb {
+    match (requested, enforced, supported) {
+        (true, true, _) => t.green,
+        (true, false, _) => t.yellow,
+        (false, _, _) => t.subtext,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Status messages
 // ---------------------------------------------------------------------------
@@ -404,11 +487,11 @@ fn render_diagnostic_footer(footer: &str) -> String {
 fn print_terminal_block(message: &str, leading_blank_line: bool) {
     let mut stderr = std::io::stderr();
     if stderr.is_terminal() {
-        let normalized = normalize_terminal_line_endings(message);
         if leading_blank_line {
-            let _ = write!(stderr, "\r\n");
+            let _ = write!(stderr, "\r\x1b[K\r\n");
         }
-        let _ = write!(stderr, "\r{}\r\n", normalized);
+        let _ = write!(stderr, "{}", render_terminal_block_for_tty(message));
+        let _ = stderr.flush();
     } else {
         if leading_blank_line {
             let _ = writeln!(stderr);
@@ -417,8 +500,14 @@ fn print_terminal_block(message: &str, leading_blank_line: bool) {
     }
 }
 
-fn normalize_terminal_line_endings(message: &str) -> String {
-    message.replace('\n', "\r\n")
+fn render_terminal_block_for_tty(message: &str) -> String {
+    let mut out = String::new();
+    for line in message.lines() {
+        out.push('\r');
+        out.push_str(line);
+        out.push_str("\x1b[K\r\n");
+    }
+    out
 }
 
 fn render_diagnostic_line(idx: usize, line: &str, t: &theme::Theme) -> String {
@@ -503,18 +592,17 @@ fn render_diagnostic_line(idx: usize, line: &str, t: &theme::Theme) -> String {
 }
 
 /// Print dry run message
-pub fn print_dry_run(program: &OsStr, cmd_args: &[OsString], silent: bool) {
+pub fn print_dry_run(
+    program: &OsStr,
+    cmd_args: &[OsString],
+    redaction_policy: &nono::ScrubPolicy,
+    silent: bool,
+) {
     if silent {
         return;
     }
     let t = theme::current();
-    let mut command = Vec::with_capacity(1 + cmd_args.len());
-    command.push(program.to_string_lossy().into_owned());
-    command.extend(
-        cmd_args
-            .iter()
-            .map(|arg| arg.to_string_lossy().into_owned()),
-    );
+    let command_line = dry_run_command_line(program, cmd_args, redaction_policy);
 
     eprintln!(
         "  {} {}",
@@ -524,11 +612,23 @@ pub fn print_dry_run(program: &OsStr, cmd_args: &[OsString], silent: bool) {
             t.subtext,
         ),
     );
-    eprintln!(
-        "  {} {}",
-        fg("$", t.subtext),
-        fg(&format_command_line(&command), t.text)
+    eprintln!("  {} {}", fg("$", t.subtext), fg(&command_line, t.text));
+}
+
+fn dry_run_command_line(
+    program: &OsStr,
+    cmd_args: &[OsString],
+    redaction_policy: &nono::ScrubPolicy,
+) -> String {
+    let mut command = Vec::with_capacity(1 + cmd_args.len());
+    command.push(program.to_string_lossy().into_owned());
+    command.extend(
+        cmd_args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned()),
     );
+
+    format_command_line(&nono::scrub_argv_with_policy(&command, redaction_policy))
 }
 
 // ---------------------------------------------------------------------------
@@ -644,17 +744,17 @@ fn sanitize_terminal_output(s: &str) -> String {
     while let Some(c) = chars.next() {
         if c == '\x1b' {
             // Skip ESC and the entire escape sequence
-            if let Some(next) = chars.next() {
-                if next == '[' {
-                    // CSI sequence: skip until a letter is found
-                    for seq_char in chars.by_ref() {
-                        if seq_char.is_ascii_alphabetic() {
-                            break;
-                        }
+            if let Some(next) = chars.next()
+                && next == '['
+            {
+                // CSI sequence: skip until a letter is found
+                for seq_char in chars.by_ref() {
+                    if seq_char.is_ascii_alphabetic() {
+                        break;
                     }
                 }
-                // OSC, other sequences: already consumed the next char, continue
             }
+            // OSC, other sequences: already consumed the next char, continue
         } else if c.is_control() && c != '\n' {
             // Strip control characters (except newline)
         } else {
@@ -763,19 +863,12 @@ pub fn print_profile_hint(program: &str, profile: &str, silent: bool) {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_unix_socket_mode_badge, normalize_terminal_line_endings, print_capabilities,
-        print_profile_hint, render_diagnostic_footer,
+        dry_run_command_line, format_unix_socket_mode_badge, print_capabilities,
+        print_profile_hint, render_diagnostic_footer, render_terminal_block_for_tty,
     };
     use nono::{CapabilitySet, UnixSocketMode};
+    use std::ffi::{OsStr, OsString};
     use tempfile::tempdir;
-
-    #[test]
-    fn normalize_terminal_line_endings_uses_crlf() {
-        assert_eq!(
-            normalize_terminal_line_endings("line one\nline two"),
-            "line one\r\nline two"
-        );
-    }
 
     #[test]
     fn render_diagnostic_footer_preserves_line_structure() {
@@ -785,8 +878,48 @@ mod tests {
     }
 
     #[test]
+    fn render_terminal_block_for_tty_clears_each_line_tail() {
+        assert_eq!(
+            render_terminal_block_for_tty("short\nnext"),
+            "\rshort\u{1b}[K\r\n\rnext\u{1b}[K\r\n"
+        );
+    }
+
+    #[test]
     fn print_profile_hint_is_noop_when_silent() {
         print_profile_hint("claude", "claude-code", true);
+    }
+
+    #[test]
+    fn dry_run_command_line_redacts_default_secrets() {
+        let line = dry_run_command_line(
+            OsStr::new("curl"),
+            &[
+                OsString::from("--token"),
+                OsString::from("real-token"),
+                OsString::from("https://example.com/api?token=real-secret"),
+            ],
+            &nono::ScrubPolicy::secure_default(),
+        );
+
+        assert!(line.contains("[REDACTED]"));
+        assert!(!line.contains("real-token"));
+        assert!(!line.contains("real-secret"));
+    }
+
+    #[test]
+    fn dry_run_command_line_uses_configured_redaction_policy() {
+        let mut redactions = nono::ScrubPolicy::secure_default();
+        redactions.add_flag("--private-token");
+
+        let line = dry_run_command_line(
+            OsStr::new("curl"),
+            &[OsString::from("--private-token=private-secret")],
+            &redactions,
+        );
+
+        assert_eq!(line, "curl '--private-token=[REDACTED]'");
+        assert!(!line.contains("private-secret"));
     }
 
     #[test]

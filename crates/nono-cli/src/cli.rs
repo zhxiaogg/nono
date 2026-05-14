@@ -32,7 +32,7 @@ const STYLES: Styles = Styles::plain().header(Style::new().bold());
   wrap       Apply sandbox and exec into command (nono disappears)
 
 \x1b[1mEXPLORATION & DEBUGGING\x1b[0m
-  learn      Trace a command to discover required filesystem paths
+  learn      [deprecated] Use `nono run` to learn from sandbox denials
   why        Check why a path or network operation would be allowed or denied
 
 \x1b[1mSESSION MANAGEMENT\x1b[0m
@@ -51,6 +51,9 @@ const STYLES: Styles = Styles::plain().header(Style::new().bold());
   pull       Install a signed nono pack from the registry
   remove     Remove an installed nono pack
   update     Update installed nono packs
+  outdated   Show which installed packs have newer versions available
+  pin        Pin a pack to its current version
+  unpin      Unpin a pack to re-include it in updates
   search     Search the registry for nono packs
   list       List installed nono packs
 
@@ -175,7 +178,8 @@ pub enum Commands {
     Wrap(Box<WrapArgs>),
 
     // ── Exploration & debugging ─────────────────────────────────────────
-    /// Trace a command to discover required filesystem paths
+    /// [deprecated] Use `nono run` to learn from sandbox denials
+    /// DEPRECATED(canonical="nono run", introduced="v0.50.1", remove_by="v1.0.0", issue="#445")
     #[command(trailing_var_arg = true)]
     #[command(help_template = "\
 {about}
@@ -185,15 +189,20 @@ pub enum Commands {
 
 {all-args}
 {after-help}")]
-    #[command(after_help = "\x1b[1mEXAMPLES\x1b[0m
-  nono learn -- my-app                         # Discover paths needed by a command
-  nono learn --profile my-profile -- my-app    # Compare against an existing profile
+    #[command(after_help = "\x1b[1mDEPRECATED\x1b[0m
+  Use `nono run --profile <name> -- <command>` instead. `nono run` keeps the
+  command sandboxed, reports denials, and offers to save profile updates.
+
+\x1b[1mEXAMPLES\x1b[0m
+  nono run --profile my-profile -- my-app      # Preferred learning workflow
+  nono learn --profile my-profile -- my-app    # Deprecated compatibility path
   nono learn --json -- node server.js          # Output as JSON for profile
   nono learn --timeout 30 -- my-app            # Limit trace duration
 
 \x1b[1mPLATFORM NOTES\x1b[0m
   Linux   Uses strace (install with: apt install strace)
-  macOS   Uses fs_usage (requires sudo)
+  macOS   Prefer: nono run --profile <name> -- <command>
+          Legacy unsandboxed fs_usage/nettop tracing: nono learn --trace -- <command>
 ")]
     Learn(Box<LearnArgs>),
 
@@ -496,7 +505,8 @@ IN-BAND DETACH:
   nono profile list                            # List all profiles (built-in and user)
   nono profile show claude-code                # Show a fully resolved profile
   nono profile diff default claude-code        # Compare two profiles
-  nono profile validate ~/my-profile.json      # Validate a user profile file
+  nono profile validate my-agent               # Validate a profile by name
+  nono profile validate ~/my-profile.json      # Validate a profile file
   nono profile validate --draft my-profile     # Validate a profile draft
   nono profile promote my-profile              # Review and apply a profile draft
   nono profile groups                          # List all policy groups
@@ -548,6 +558,8 @@ IN-BAND DETACH:
     #[command(after_help = "\x1b[1mEXAMPLES\x1b[0m
   nono update
   nono update always-further/claude
+  nono update --dry-run
+  nono update --force                          # also update pinned packs
 ")]
     Update(UpdateArgs),
 
@@ -580,6 +592,49 @@ IN-BAND DETACH:
   nono list --installed --json
 ")]
     List(ListArgs),
+
+    /// Pin an installed pack to its current version, excluding it from updates
+    #[command(help_template = "\
+{about}
+
+\x1b[1mUSAGE\x1b[0m
+  nono pin <namespace>/<name>
+
+{all-args}
+{after-help}")]
+    #[command(after_help = "\x1b[1mEXAMPLES\x1b[0m
+  nono pin always-further/claude
+")]
+    Pin(PinArgs),
+
+    /// Unpin a pack so it is included in updates again
+    #[command(help_template = "\
+{about}
+
+\x1b[1mUSAGE\x1b[0m
+  nono unpin <namespace>/<name>
+
+{all-args}
+{after-help}")]
+    #[command(after_help = "\x1b[1mEXAMPLES\x1b[0m
+  nono unpin always-further/claude
+")]
+    Unpin(UnpinArgs),
+
+    /// Show which installed packs have newer versions available
+    #[command(help_template = "\
+{about}
+
+\x1b[1mUSAGE\x1b[0m
+  nono outdated [flags]
+
+{all-args}
+{after-help}")]
+    #[command(after_help = "\x1b[1mEXAMPLES\x1b[0m
+  nono outdated
+  nono outdated --json
+")]
+    Outdated(OutdatedArgs),
 
     /// Generate shell completion scripts
     #[command(name = "completion")]
@@ -667,7 +722,11 @@ pub struct UpdateArgs {
     )]
     pub registry: Option<String>,
 
-    /// Accept signer changes
+    /// Show what would be updated without making changes
+    #[arg(long, help_heading = "OPTIONS")]
+    pub dry_run: bool,
+
+    /// Update pinned packs and accept signer changes
     #[arg(long, help_heading = "OPTIONS")]
     pub force: bool,
 
@@ -706,6 +765,49 @@ pub struct ListArgs {
     /// Show installed nono packs
     #[arg(long, help_heading = "OPTIONS")]
     pub installed: bool,
+
+    /// Output as JSON
+    #[arg(long, help_heading = "OPTIONS")]
+    pub json: bool,
+
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
+}
+
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct PinArgs {
+    /// Installed package reference (<namespace>/<name>)
+    pub package_ref: String,
+
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
+}
+
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct UnpinArgs {
+    /// Installed package reference (<namespace>/<name>)
+    pub package_ref: String,
+
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
+}
+
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct OutdatedArgs {
+    /// Registry base URL
+    #[arg(
+        long,
+        env = "NONO_REGISTRY",
+        value_name = "URL",
+        help_heading = "OPTIONS"
+    )]
+    pub registry: Option<String>,
 
     /// Output as JSON
     #[arg(long, help_heading = "OPTIONS")]
@@ -966,16 +1068,28 @@ pub struct SandboxArgs {
     #[arg(long, value_name = "SOCKET", help_heading = "FILESYSTEM")]
     pub allow_unix_socket_bind: Vec<PathBuf>,
 
-    /// Allow connect() to any AF_UNIX socket directly within this directory
-    /// (non-recursive; implies --read)
+    /// Allow connect() to any AF_UNIX socket directly within this directory.
+    /// Non-recursive on macOS and future Linux AF_UNIX mediation; current
+    /// Linux Landlock filesystem fallback is recursive.
     #[arg(long, value_name = "DIR", help_heading = "FILESYSTEM")]
     pub allow_unix_socket_dir: Vec<PathBuf>,
 
     /// Allow connect() and bind() on any AF_UNIX socket directly within this
-    /// directory (non-recursive; implies --allow). Use for runtime-generated
-    /// socket filenames (PID-derived paths, etc.).
+    /// directory. Non-recursive on macOS and future Linux AF_UNIX mediation;
+    /// current Linux Landlock filesystem fallback is recursive. Use for
+    /// runtime-generated socket filenames (PID-derived paths, etc.).
     #[arg(long, value_name = "DIR", help_heading = "FILESYSTEM")]
     pub allow_unix_socket_dir_bind: Vec<PathBuf>,
+
+    /// Allow connect() to any AF_UNIX socket within this directory subtree
+    /// (recursive; implies --read)
+    #[arg(long, value_name = "DIR", help_heading = "FILESYSTEM")]
+    pub allow_unix_socket_subtree: Vec<PathBuf>,
+
+    /// Allow connect() and bind() on any AF_UNIX socket within this directory
+    /// subtree (recursive; implies --allow).
+    #[arg(long, value_name = "DIR", help_heading = "FILESYSTEM")]
+    pub allow_unix_socket_subtree_bind: Vec<PathBuf>,
 
     /// Override a deny rule for a path. Pair with --allow/--read/--write grant
     /// ALIAS(canonical="--bypass-protection", introduced="v0.41.0", remove_by="v1.0.0", issue="#594")
@@ -986,6 +1100,16 @@ pub struct SandboxArgs {
         help_heading = "FILESYSTEM"
     )]
     pub bypass_protection: Vec<PathBuf>,
+
+    /// Suppress save-profile prompts for denials under this path. Does not grant access
+    /// ALIAS(canonical="--suppress-save-prompt", introduced="v0.52.0", remove_by="indefinite", issue="#875")
+    #[arg(
+        long = "suppress-save-prompt",
+        alias = "ignore-denied",
+        value_name = "PATH",
+        help_heading = "FILESYSTEM"
+    )]
+    pub suppress_save_prompt: Vec<PathBuf>,
 
     /// Allow CWD access without prompting (level set by profile, defaults to read-only)
     #[arg(long, help_heading = "FILESYSTEM")]
@@ -1187,7 +1311,8 @@ pub struct SandboxArgs {
             "allow", "read", "write", "allow_file", "read_file", "write_file",
             "allow_unix_socket", "allow_unix_socket_bind",
             "allow_unix_socket_dir", "allow_unix_socket_dir_bind",
-            "profile", "bypass_protection", "allow_cwd",
+            "allow_unix_socket_subtree", "allow_unix_socket_subtree_bind",
+            "profile", "bypass_protection", "suppress_save_prompt", "allow_cwd",
             "block_net", "allow_net", "network_profile", "allow_proxy",
             "allow_bind", "allow_port", "allow_connect_port", "external_proxy", "proxy_port",
             "proxy_credential", "allow_endpoint", "env_credential", "env_credential_map",
@@ -1263,16 +1388,28 @@ pub struct WrapSandboxArgs {
     #[arg(long, value_name = "SOCKET", help_heading = "FILESYSTEM")]
     pub allow_unix_socket_bind: Vec<PathBuf>,
 
-    /// Allow connect() to any AF_UNIX socket directly within this directory
-    /// (non-recursive; implies --read)
+    /// Allow connect() to any AF_UNIX socket directly within this directory.
+    /// Non-recursive on macOS and future Linux AF_UNIX mediation; current
+    /// Linux Landlock filesystem fallback is recursive.
     #[arg(long, value_name = "DIR", help_heading = "FILESYSTEM")]
     pub allow_unix_socket_dir: Vec<PathBuf>,
 
     /// Allow connect() and bind() on any AF_UNIX socket directly within this
-    /// directory (non-recursive; implies --allow). Use for runtime-generated
-    /// socket filenames (PID-derived paths, etc.).
+    /// directory. Non-recursive on macOS and future Linux AF_UNIX mediation;
+    /// current Linux Landlock filesystem fallback is recursive. Use for
+    /// runtime-generated socket filenames (PID-derived paths, etc.).
     #[arg(long, value_name = "DIR", help_heading = "FILESYSTEM")]
     pub allow_unix_socket_dir_bind: Vec<PathBuf>,
+
+    /// Allow connect() to any AF_UNIX socket within this directory subtree
+    /// (recursive; implies --read)
+    #[arg(long, value_name = "DIR", help_heading = "FILESYSTEM")]
+    pub allow_unix_socket_subtree: Vec<PathBuf>,
+
+    /// Allow connect() and bind() on any AF_UNIX socket within this directory
+    /// subtree (recursive; implies --allow).
+    #[arg(long, value_name = "DIR", help_heading = "FILESYSTEM")]
+    pub allow_unix_socket_subtree_bind: Vec<PathBuf>,
 
     /// Override a deny rule for a path. Pair with --allow/--read/--write grant
     /// ALIAS(canonical="--bypass-protection", introduced="v0.41.0", remove_by="v1.0.0", issue="#594")
@@ -1283,6 +1420,16 @@ pub struct WrapSandboxArgs {
         help_heading = "FILESYSTEM"
     )]
     pub bypass_protection: Vec<PathBuf>,
+
+    /// Suppress save-profile prompts for denials under this path. Does not grant access
+    /// ALIAS(canonical="--suppress-save-prompt", introduced="v0.52.0", remove_by="indefinite", issue="#875")
+    #[arg(
+        long = "suppress-save-prompt",
+        alias = "ignore-denied",
+        value_name = "PATH",
+        help_heading = "FILESYSTEM"
+    )]
+    pub suppress_save_prompt: Vec<PathBuf>,
 
     /// Allow CWD access without prompting (level set by profile, defaults to read-only)
     #[arg(long, help_heading = "FILESYSTEM")]
@@ -1391,7 +1538,8 @@ pub struct WrapSandboxArgs {
             "allow", "read", "write", "allow_file", "read_file", "write_file",
             "allow_unix_socket", "allow_unix_socket_bind",
             "allow_unix_socket_dir", "allow_unix_socket_dir_bind",
-            "profile", "bypass_protection", "allow_cwd",
+            "allow_unix_socket_subtree", "allow_unix_socket_subtree_bind",
+            "profile", "bypass_protection", "suppress_save_prompt", "allow_cwd",
             "block_net", "allow_bind", "allow_port", "allow_connect_port",
             "env_credential", "env_credential_map",
             "allow_command", "block_command", "allow_launch_services", "allow_gpu",
@@ -1422,7 +1570,10 @@ impl From<WrapSandboxArgs> for SandboxArgs {
             allow_unix_socket_bind: args.allow_unix_socket_bind,
             allow_unix_socket_dir: args.allow_unix_socket_dir,
             allow_unix_socket_dir_bind: args.allow_unix_socket_dir_bind,
+            allow_unix_socket_subtree: args.allow_unix_socket_subtree,
+            allow_unix_socket_subtree_bind: args.allow_unix_socket_subtree_bind,
             bypass_protection: args.bypass_protection,
+            suppress_save_prompt: args.suppress_save_prompt,
             allow_cwd: args.allow_cwd,
             workdir: args.workdir,
             block_net: args.block_net,
@@ -1638,6 +1789,10 @@ pub struct WhyArgs {
     #[arg(long, help_heading = "QUERY")]
     pub host: Option<String>,
 
+    /// Landlock scope to check
+    #[arg(long, value_enum, value_name = "SCOPE", help_heading = "QUERY")]
+    pub scope: Option<WhyScope>,
+
     /// Network port (default 443)
     #[arg(long, default_value = "443", help_heading = "QUERY")]
     pub port: u16,
@@ -1716,6 +1871,10 @@ pub struct LearnArgs {
     #[arg(long, help_heading = "OPTIONS")]
     pub no_rdns: bool,
 
+    /// On macOS, use legacy unsandboxed fs_usage/nettop tracing
+    #[arg(long, help_heading = "OPTIONS")]
+    pub trace: bool,
+
     /// Enable verbose output
     #[arg(long, short = 'v', action = clap::ArgAction::Count, help_heading = "OPTIONS")]
     pub verbose: u8,
@@ -1739,6 +1898,16 @@ pub enum WhyOp {
     /// Read and write access
     #[value(name = "readwrite")]
     ReadWrite,
+}
+
+/// Landlock scope type for why command
+#[derive(Clone, Debug, ValueEnum)]
+pub enum WhyScope {
+    /// Signal scoping
+    Signal,
+    /// Abstract UNIX socket scoping
+    #[value(name = "abstract-unix-socket")]
+    AbstractUnixSocket,
 }
 
 #[derive(Parser, Debug)]
@@ -3074,6 +3243,40 @@ mod tests {
             }
             _ => panic!("Expected Why command"),
         }
+
+        let cli = Cli::parse_from(["nono", "why", "--scope", "abstract-unix-socket"]);
+        match cli.command {
+            Commands::Why(args) => {
+                assert!(matches!(args.scope, Some(WhyScope::AbstractUnixSocket)));
+            }
+            _ => panic!("Expected Why command"),
+        }
+    }
+
+    #[test]
+    fn test_unix_socket_subtree_flags_parse() {
+        let cli = Cli::parse_from([
+            "nono",
+            "run",
+            "--allow-unix-socket-subtree",
+            "/tmp/nx",
+            "--allow-unix-socket-subtree-bind",
+            "/tmp/nx-bind",
+            "echo",
+        ]);
+        match cli.command {
+            Commands::Run(args) => {
+                assert_eq!(
+                    args.sandbox.allow_unix_socket_subtree,
+                    vec![PathBuf::from("/tmp/nx")]
+                );
+                assert_eq!(
+                    args.sandbox.allow_unix_socket_subtree_bind,
+                    vec![PathBuf::from("/tmp/nx-bind")]
+                );
+            }
+            _ => panic!("Expected Run command"),
+        }
     }
 
     #[test]
@@ -3171,6 +3374,57 @@ mod tests {
                 assert_eq!(
                     args.sandbox.bypass_protection[0],
                     PathBuf::from("/tmp/test")
+                );
+            }
+            _ => panic!("Expected Run command"),
+        }
+    }
+
+    #[test]
+    fn test_suppress_save_prompt_multiple() {
+        let cli = Cli::parse_from([
+            "nono",
+            "run",
+            "--suppress-save-prompt",
+            "/tmp/a",
+            "--suppress-save-prompt",
+            "/tmp/b",
+            "--allow",
+            ".",
+            "echo",
+        ]);
+        match cli.command {
+            Commands::Run(args) => {
+                assert_eq!(args.sandbox.suppress_save_prompt.len(), 2);
+                assert_eq!(
+                    args.sandbox.suppress_save_prompt[0],
+                    PathBuf::from("/tmp/a")
+                );
+                assert_eq!(
+                    args.sandbox.suppress_save_prompt[1],
+                    PathBuf::from("/tmp/b")
+                );
+            }
+            _ => panic!("Expected Run command"),
+        }
+    }
+
+    #[test]
+    fn test_ignore_denied_alias_maps_to_suppress_save_prompt() {
+        let cli = Cli::parse_from([
+            "nono",
+            "run",
+            "--ignore-denied",
+            "/tmp/a",
+            "--allow",
+            ".",
+            "echo",
+        ]);
+        match cli.command {
+            Commands::Run(args) => {
+                assert_eq!(
+                    args.sandbox.suppress_save_prompt,
+                    vec![PathBuf::from("/tmp/a")]
                 );
             }
             _ => panic!("Expected Run command"),
@@ -3359,12 +3613,12 @@ mod tests {
         let cli =
             Cli::try_parse_from(["nono", "profile", "show", "default", "--format", "manifest"])
                 .expect("profile show --format manifest must parse");
-        if let Commands::Profile(args) = cli.command {
-            if let ProfileCommands::Show(a) = args.command {
-                assert_eq!(a.profile, "default");
-                assert!(matches!(a.format, Some(ProfileShowFormat::Manifest)));
-                return;
-            }
+        if let Commands::Profile(args) = cli.command
+            && let ProfileCommands::Show(a) = args.command
+        {
+            assert_eq!(a.profile, "default");
+            assert!(matches!(a.format, Some(ProfileShowFormat::Manifest)));
+            return;
         }
         panic!("expected Commands::Profile(Show(..))");
     }
@@ -3373,12 +3627,12 @@ mod tests {
     fn test_profile_show_parses_with_json_and_raw() {
         let cli = Cli::try_parse_from(["nono", "profile", "show", "default", "--json", "--raw"])
             .expect("profile show --json --raw must parse");
-        if let Commands::Profile(args) = cli.command {
-            if let ProfileCommands::Show(a) = args.command {
-                assert!(a.json);
-                assert!(a.raw);
-                return;
-            }
+        if let Commands::Profile(args) = cli.command
+            && let ProfileCommands::Show(a) = args.command
+        {
+            assert!(a.json);
+            assert!(a.raw);
+            return;
         }
         panic!("expected Commands::Profile(Show(..))");
     }
@@ -3387,12 +3641,12 @@ mod tests {
     fn test_profile_groups_parses() {
         let cli = Cli::try_parse_from(["nono", "profile", "groups", "--json", "--all-platforms"])
             .expect("profile groups --json --all-platforms must parse");
-        if let Commands::Profile(args) = cli.command {
-            if let ProfileCommands::Groups(a) = args.command {
-                assert!(a.json);
-                assert!(a.all_platforms);
-                return;
-            }
+        if let Commands::Profile(args) = cli.command
+            && let ProfileCommands::Groups(a) = args.command
+        {
+            assert!(a.json);
+            assert!(a.all_platforms);
+            return;
         }
         panic!("expected Commands::Profile(Groups(..))");
     }
@@ -3401,11 +3655,11 @@ mod tests {
     fn test_profile_groups_with_name() {
         let cli = Cli::try_parse_from(["nono", "profile", "groups", "deny_credentials"])
             .expect("profile groups <name> must parse");
-        if let Commands::Profile(args) = cli.command {
-            if let ProfileCommands::Groups(a) = args.command {
-                assert_eq!(a.name.as_deref(), Some("deny_credentials"));
-                return;
-            }
+        if let Commands::Profile(args) = cli.command
+            && let ProfileCommands::Groups(a) = args.command
+        {
+            assert_eq!(a.name.as_deref(), Some("deny_credentials"));
+            return;
         }
         panic!("expected Commands::Profile(Groups(..))");
     }
@@ -3414,12 +3668,12 @@ mod tests {
     fn test_profile_diff_parses() {
         let cli = Cli::try_parse_from(["nono", "profile", "diff", "a", "b"])
             .expect("profile diff must parse");
-        if let Commands::Profile(args) = cli.command {
-            if let ProfileCommands::Diff(a) = args.command {
-                assert_eq!(a.profile1, "a");
-                assert_eq!(a.profile2, "b");
-                return;
-            }
+        if let Commands::Profile(args) = cli.command
+            && let ProfileCommands::Diff(a) = args.command
+        {
+            assert_eq!(a.profile1, "a");
+            assert_eq!(a.profile2, "b");
+            return;
         }
         panic!("expected Commands::Profile(Diff(..))");
     }
@@ -3428,11 +3682,11 @@ mod tests {
     fn test_profile_validate_parses() {
         let cli = Cli::try_parse_from(["nono", "profile", "validate", "/tmp/p.json"])
             .expect("profile validate must parse");
-        if let Commands::Profile(args) = cli.command {
-            if let ProfileCommands::Validate(a) = args.command {
-                assert_eq!(a.file.to_string_lossy(), "/tmp/p.json");
-                return;
-            }
+        if let Commands::Profile(args) = cli.command
+            && let ProfileCommands::Validate(a) = args.command
+        {
+            assert_eq!(a.file.to_string_lossy(), "/tmp/p.json");
+            return;
         }
         panic!("expected Commands::Profile(Validate(..))");
     }
@@ -3461,6 +3715,9 @@ mod tests {
         "pull",
         "remove",
         "update",
+        "outdated",
+        "pin",
+        "unpin",
         "search",
         "list",
         "completion",

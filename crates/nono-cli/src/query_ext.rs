@@ -5,7 +5,7 @@
 
 use crate::config;
 use colored::Colorize;
-use nono::{try_canonicalize, AccessMode, CapabilitySet, Result};
+use nono::{AccessMode, CapabilitySet, Result, try_canonicalize};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -19,6 +19,24 @@ pub struct CapabilityMatch {
     pub access: String,
     /// Capability source such as user, profile, group:<name>, or system.
     pub source: String,
+}
+
+/// Scope type for Landlock scope policy queries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopeQuery {
+    /// `LANDLOCK_SCOPE_SIGNAL`.
+    Signal,
+    /// `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET`.
+    AbstractUnixSocket,
+}
+
+impl ScopeQuery {
+    fn as_str(self) -> &'static str {
+        match self {
+            ScopeQuery::Signal => "signal",
+            ScopeQuery::AbstractUnixSocket => "abstract-unix-socket",
+        }
+    }
 }
 
 /// Result of querying whether an operation is permitted
@@ -52,6 +70,19 @@ pub enum QueryResult {
     /// Not running inside a sandbox
     #[serde(rename = "not_sandboxed")]
     NotSandboxed { message: String },
+    /// Landlock scope policy status.
+    #[serde(rename = "scope")]
+    Scope {
+        scope: String,
+        state: String,
+        requested: bool,
+        enforced: bool,
+        supported: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        kernel_abi: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        details: Option<String>,
+    },
 }
 
 /// Query whether a path operation is permitted
@@ -77,19 +108,19 @@ pub fn query_path(
 
     // Check if this is a sensitive path (CLI security policy), but skip
     // the check for paths that have been explicitly overridden.
-    if !is_overridden {
-        if let Some(matched) = config::check_sensitive_path(&canonical.to_string_lossy())? {
-            return Ok(QueryResult::Denied {
-                reason: "sensitive_path".to_string(),
-                details: Some(format!(
-                    "Blocked by policy group '{}': {} Use filesystem.bypass_protection to exempt specific paths when appropriate.",
-                    matched.group_name, matched.description
-                )),
-                policy_source: Some(format!("group:{}", matched.group_name)),
-                matching_capability: None,
-                suggested_flag: None,
-            });
-        }
+    if !is_overridden
+        && let Some(matched) = config::check_sensitive_path(&canonical.to_string_lossy())?
+    {
+        return Ok(QueryResult::Denied {
+            reason: "sensitive_path".to_string(),
+            details: Some(format!(
+                "Blocked by policy group '{}': {} Use filesystem.bypass_protection to exempt specific paths when appropriate.",
+                matched.group_name, matched.description
+            )),
+            policy_source: Some(format!("group:{}", matched.group_name)),
+            matching_capability: None,
+            suggested_flag: None,
+        });
     }
 
     // Check capabilities. Prefer the most specific matching grant so broad system
@@ -170,25 +201,155 @@ pub fn query_path(
     })
 }
 
-/// Query whether network access is permitted
-pub fn query_network(host: &str, port: u16, caps: &CapabilitySet) -> QueryResult {
-    if caps.is_network_blocked() {
-        QueryResult::Denied {
+/// Query whether network access is permitted.
+///
+/// `allowed_domains` contains the resolved proxy allowlist (from profile
+/// `allow_domain`, network profile hosts, and CLI `--allow-domain`).
+/// When the network mode is `ProxyOnly`, delegates to `HostFilter` for
+/// consistent matching with the proxy (including cloud metadata deny list).
+pub fn query_network(
+    host: &str,
+    port: u16,
+    caps: &CapabilitySet,
+    allowed_domains: &[String],
+) -> QueryResult {
+    match caps.network_mode() {
+        nono::NetworkMode::Blocked => QueryResult::Denied {
             reason: "network_blocked".to_string(),
             details: Some(format!(
-                "Network access is blocked. Connection to {}:{} would be denied.",
+                "Network access is fully blocked. Connection to {}:{} would be denied.",
                 host, port
             )),
             policy_source: None,
             matching_capability: None,
-            suggested_flag: None,
+            suggested_flag: Some(format!("--allow-domain {}", host)),
+        },
+        nono::NetworkMode::ProxyOnly { .. } => {
+            let filter = if allowed_domains.is_empty() {
+                nono::net_filter::HostFilter::allow_all()
+            } else {
+                nono::net_filter::HostFilter::new(allowed_domains)
+            };
+            // Pass empty IPs: DNS resolution happens at proxy time, not query time.
+            match filter.check_host(host, &[]) {
+                nono::net_filter::FilterResult::Allow => QueryResult::Allowed {
+                    reason: "proxy_allowed".to_string(),
+                    granted_path: None,
+                    access: Some(format!(
+                        "Connection to {}:{} would be allowed via proxy{}",
+                        host,
+                        port,
+                        if allowed_domains.is_empty() {
+                            " (no domain filter)"
+                        } else {
+                            ""
+                        }
+                    )),
+                    source: Some(if allowed_domains.is_empty() {
+                        "proxy".to_string()
+                    } else {
+                        "domain allowlist".to_string()
+                    }),
+                },
+                deny => QueryResult::Denied {
+                    reason: "proxy_filtered".to_string(),
+                    details: Some(format!("Domain filtering is active. {}", deny.reason())),
+                    policy_source: Some("proxy domain filter".to_string()),
+                    matching_capability: None,
+                    suggested_flag: Some(format!("--allow-domain {}", host)),
+                },
+            }
         }
-    } else {
-        QueryResult::Allowed {
+        nono::NetworkMode::AllowAll => QueryResult::Allowed {
             reason: "network_allowed".to_string(),
             granted_path: None,
             access: Some(format!("Connection to {}:{} would be allowed", host, port)),
             source: None,
+        },
+    }
+}
+
+/// Query whether a Landlock scope is requested and enforced.
+#[cfg(target_os = "linux")]
+pub fn query_scope(scope: ScopeQuery, caps: &CapabilitySet) -> QueryResult {
+    match nono::landlock_scope_policy(caps) {
+        Ok(policy) => {
+            let (requested, enforced) = match scope {
+                ScopeQuery::Signal => (policy.signal_requested, policy.signal_enforced),
+                ScopeQuery::AbstractUnixSocket => (
+                    policy.abstract_unix_socket_requested,
+                    policy.abstract_unix_socket_enforced,
+                ),
+            };
+            QueryResult::Scope {
+                scope: scope.as_str().to_string(),
+                state: scope_state(requested, enforced, policy.scoping_supported).to_string(),
+                requested,
+                enforced,
+                supported: policy.scoping_supported,
+                kernel_abi: Some(policy.abi_version.to_string()),
+                details: Some(scope_details(
+                    scope,
+                    requested,
+                    enforced,
+                    policy.scoping_supported,
+                )),
+            }
+        }
+        Err(err) => QueryResult::Scope {
+            scope: scope.as_str().to_string(),
+            state: "unavailable".to_string(),
+            requested: false,
+            enforced: false,
+            supported: false,
+            kernel_abi: None,
+            details: Some(format!(
+                "Landlock scope policy could not be resolved: {err}"
+            )),
+        },
+    }
+}
+
+/// Query whether a Landlock scope is requested and enforced.
+#[cfg(not(target_os = "linux"))]
+pub fn query_scope(scope: ScopeQuery, _caps: &CapabilitySet) -> QueryResult {
+    QueryResult::Scope {
+        scope: scope.as_str().to_string(),
+        state: "not_applicable".to_string(),
+        requested: false,
+        enforced: false,
+        supported: false,
+        kernel_abi: None,
+        details: Some("Landlock scope queries are only available on Linux.".to_string()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn scope_state(requested: bool, enforced: bool, supported: bool) -> &'static str {
+    match (requested, enforced, supported) {
+        (true, true, _) => "enforced",
+        (true, false, false) => "unsupported",
+        (true, false, true) => "not_enforced",
+        (false, _, _) => "not_requested",
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn scope_details(scope: ScopeQuery, requested: bool, enforced: bool, supported: bool) -> String {
+    let label = scope.as_str();
+    match (requested, enforced, supported) {
+        (true, true, _) => {
+            format!("{label} scope is requested by the capability set and enforced.")
+        }
+        (true, false, false) => {
+            format!("{label} scope is requested, but this Landlock ABI does not support scoping.")
+        }
+        (true, false, true) => {
+            format!("{label} scope is requested, but it is not enforced.")
+        }
+        (false, _, true) => format!("{label} scope is not requested by the capability set."),
+        (false, _, false) => {
+            format!("{label} scope is not requested; this Landlock ABI has no scope support.")
         }
     }
 }
@@ -242,6 +403,28 @@ pub fn print_result(result: &QueryResult) {
         QueryResult::NotSandboxed { message } => {
             println!("{}", "NOT SANDBOXED".yellow().bold());
             println!("  {}", message);
+        }
+        QueryResult::Scope {
+            scope,
+            state,
+            requested,
+            enforced,
+            supported,
+            kernel_abi,
+            details,
+        } => {
+            println!("{}", "SCOPE".blue().bold());
+            println!("  Scope: {}", scope);
+            println!("  State: {}", state);
+            println!("  Requested: {}", requested);
+            println!("  Enforced: {}", enforced);
+            println!("  Supported: {}", supported);
+            if let Some(abi) = kernel_abi {
+                println!("  Kernel ABI: {}", abi);
+            }
+            if let Some(detail) = details {
+                println!("  Details: {}", detail);
+            }
         }
     }
 }
@@ -418,9 +601,11 @@ mod tests {
                 let capability = matching_capability.expect("expected matching capability");
                 assert_eq!(capability.access, "read");
                 assert_eq!(capability.source, "group:dev");
-                assert!(details
-                    .as_deref()
-                    .is_some_and(|d| d.contains("group:dev") && d.contains("write was requested")));
+                assert!(
+                    details.as_deref().is_some_and(
+                        |d| d.contains("group:dev") && d.contains("write was requested")
+                    )
+                );
             }
             _ => panic!("expected denied result"),
         }
@@ -448,12 +633,16 @@ mod tests {
                 ..
             } => {
                 assert_eq!(reason, "sensitive_path");
-                assert!(policy_source
-                    .as_deref()
-                    .is_some_and(|policy| policy.starts_with("group:")));
-                assert!(details
-                    .as_deref()
-                    .is_some_and(|detail| detail.contains("filesystem.bypass_protection")));
+                assert!(
+                    policy_source
+                        .as_deref()
+                        .is_some_and(|policy| policy.starts_with("group:"))
+                );
+                assert!(
+                    details
+                        .as_deref()
+                        .is_some_and(|detail| detail.contains("filesystem.bypass_protection"))
+                );
                 assert!(suggested_flag.is_none());
             }
             _ => panic!("expected denied result"),
@@ -462,15 +651,109 @@ mod tests {
 
     #[test]
     fn test_query_network_allowed() {
-        let caps = CapabilitySet::new(); // Network allowed by default
-        let result = query_network("example.com", 443, &caps);
+        let caps = CapabilitySet::new();
+        let result = query_network("example.com", 443, &caps, &[]);
         assert!(matches!(result, QueryResult::Allowed { .. }));
     }
 
     #[test]
     fn test_query_network_blocked() {
         let caps = CapabilitySet::new().block_network();
-        let result = query_network("example.com", 443, &caps);
+        let result = query_network("example.com", 443, &caps, &[]);
         assert!(matches!(result, QueryResult::Denied { .. }));
+    }
+
+    #[test]
+    fn test_query_scope_returns_structured_result() {
+        let caps = CapabilitySet::new();
+        let result = query_scope(ScopeQuery::AbstractUnixSocket, &caps);
+        match result {
+            QueryResult::Scope {
+                scope,
+                state,
+                requested,
+                enforced,
+                ..
+            } => {
+                assert_eq!(scope, "abstract-unix-socket");
+                assert!(!state.is_empty());
+                assert!(!enforced || requested);
+            }
+            _ => panic!("expected scope result"),
+        }
+    }
+
+    #[test]
+    fn test_query_network_proxy_domain_filtering() {
+        let caps = CapabilitySet::new().set_network_mode(nono::NetworkMode::ProxyOnly {
+            port: 0,
+            bind_ports: vec![],
+        });
+        let allowed = vec!["api.example.com".to_string()];
+
+        let result = query_network("api.example.com", 443, &caps, &allowed);
+        assert!(matches!(result, QueryResult::Allowed { .. }));
+
+        match query_network("evil.com", 443, &caps, &allowed) {
+            QueryResult::Denied {
+                reason,
+                suggested_flag,
+                ..
+            } => {
+                assert_eq!(reason, "proxy_filtered");
+                assert_eq!(suggested_flag.as_deref(), Some("--allow-domain evil.com"));
+            }
+            _ => panic!("expected denied result"),
+        }
+    }
+
+    #[test]
+    fn test_query_network_proxy_wildcard_and_bare_domain() {
+        let caps = CapabilitySet::new().set_network_mode(nono::NetworkMode::ProxyOnly {
+            port: 0,
+            bind_ports: vec![],
+        });
+        let allowed = vec!["*.example.com".to_string()];
+
+        assert!(matches!(
+            query_network("sub.example.com", 443, &caps, &allowed),
+            QueryResult::Allowed { .. }
+        ));
+        // *.example.com must NOT match bare example.com (mirrors HostFilter)
+        assert!(matches!(
+            query_network("example.com", 443, &caps, &allowed),
+            QueryResult::Denied { .. }
+        ));
+    }
+
+    #[test]
+    fn test_query_network_proxy_no_domain_filter() {
+        let caps = CapabilitySet::new().set_network_mode(nono::NetworkMode::ProxyOnly {
+            port: 0,
+            bind_ports: vec![],
+        });
+        assert!(matches!(
+            query_network("anything.com", 443, &caps, &[]),
+            QueryResult::Allowed { .. }
+        ));
+    }
+
+    #[test]
+    fn test_query_network_proxy_denies_cloud_metadata() {
+        let caps = CapabilitySet::new().set_network_mode(nono::NetworkMode::ProxyOnly {
+            port: 0,
+            bind_ports: vec![],
+        });
+        // Cloud metadata endpoints are denied even with an empty allowlist
+        assert!(matches!(
+            query_network("169.254.169.254", 80, &caps, &[]),
+            QueryResult::Denied { .. }
+        ));
+        // Also denied even if explicitly in the allowlist
+        let allowed = vec!["169.254.169.254".to_string()];
+        assert!(matches!(
+            query_network("169.254.169.254", 80, &caps, &allowed),
+            QueryResult::Denied { .. }
+        ));
     }
 }

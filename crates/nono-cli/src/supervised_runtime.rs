@@ -4,16 +4,17 @@ use crate::launch_runtime::{
     ProxyLaunchOptions, RollbackLaunchOptions, SessionLaunchOptions, TrustLaunchOptions,
 };
 use crate::rollback_runtime::{
-    create_audit_state, finalize_supervised_exit, initialize_audit_snapshots,
-    initialize_rollback_state, warn_if_rollback_flags_ignored, AuditState, RollbackExitContext,
+    AuditState, RollbackExitContext, create_audit_state, finalize_supervised_exit,
+    initialize_audit_snapshots, initialize_rollback_state, warn_if_rollback_flags_ignored,
 };
 use crate::{
-    exec_strategy, output, protected_paths, pty_proxy, session, terminal_approval, trust_intercept,
-    DETACHED_SESSION_ID_ENV,
+    DETACHED_SESSION_ID_ENV, exec_strategy, output, protected_paths, pty_proxy, session,
+    terminal_approval, trust_intercept,
 };
 use colored::Colorize;
 use nono::undo::ExecutableIdentity;
 use nono::{CapabilitySet, Result};
+use std::io::IsTerminal;
 use std::sync::Mutex;
 
 struct SessionRuntimeState {
@@ -34,6 +35,7 @@ pub(crate) struct SupervisedRuntimeContext<'a> {
     pub(crate) proxy_handle: Option<&'a nono_proxy::server::ProxyHandle>,
     pub(crate) executable_identity: Option<&'a ExecutableIdentity>,
     pub(crate) audit_signer: Option<&'a AuditSigner>,
+    pub(crate) redaction_policy: &'a nono::ScrubPolicy,
     pub(crate) silent: bool,
 }
 
@@ -83,6 +85,7 @@ fn create_session_runtime_state(
     caps: &CapabilitySet,
     session: &SessionLaunchOptions,
     audit_state: Option<&AuditState>,
+    redaction_policy: &nono::ScrubPolicy,
 ) -> Result<SessionRuntimeState> {
     let started = chrono::Local::now().to_rfc3339();
     let short_session_id = std::env::var(DETACHED_SESSION_ID_ENV)
@@ -108,7 +111,7 @@ fn create_session_runtime_state(
             session::SessionAttachment::Attached
         },
         exit_code: None,
-        command: command.to_vec(),
+        command: nono::scrub_argv_with_policy(command, redaction_policy),
         profile: session.profile_name.clone(),
         workdir: std::env::current_dir().unwrap_or_default(),
         network: match caps.network_mode() {
@@ -119,7 +122,12 @@ fn create_session_runtime_state(
         rollback_session: audit_state.map(|state| state.session_id.clone()),
     };
     let session_guard = Some(session::SessionGuard::new(session_record)?);
-    let pty_pair = if session.detached_start {
+    let pty_pair = if should_open_supervised_pty(
+        session.detached_start,
+        std::io::stdin().is_terminal(),
+        std::io::stdout().is_terminal(),
+        std::io::stderr().is_terminal(),
+    ) {
         Some(pty_proxy::open_pty()?)
     } else {
         None
@@ -131,6 +139,15 @@ fn create_session_runtime_state(
         session_guard,
         pty_pair,
     })
+}
+
+fn should_open_supervised_pty(
+    detached_start: bool,
+    stdin_is_terminal: bool,
+    stdout_is_terminal: bool,
+    stderr_is_terminal: bool,
+) -> bool {
+    detached_start || (stdin_is_terminal && stdout_is_terminal && stderr_is_terminal)
 }
 
 pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> Result<i32> {
@@ -145,6 +162,7 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         proxy_handle,
         executable_identity,
         audit_signer,
+        redaction_policy,
         silent,
     } = ctx;
 
@@ -160,8 +178,13 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
     // until after the baseline walk, the 30-second startup timeout can fire
     // before the session becomes attachable.
     let trust_interceptor = create_trust_interceptor(trust);
-    let session_runtime =
-        create_session_runtime_state(command, caps, session, audit_state.as_ref())?;
+    let session_runtime = create_session_runtime_state(
+        command,
+        caps,
+        session,
+        audit_state.as_ref(),
+        redaction_policy,
+    )?;
     let SessionRuntimeState {
         started,
         short_session_id,
@@ -182,11 +205,17 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
     let audit_recorder = if audit_state.is_some() && !rollback.no_audit_integrity {
         audit_state
             .as_ref()
-            .map(|state| AuditRecorder::new(state.session_dir.clone()).map(Mutex::new))
+            .map(|state| {
+                AuditRecorder::new_with_policy(state.session_dir.clone(), redaction_policy.clone())
+                    .map(Mutex::new)
+            })
             .transpose()?
     } else {
         None
     };
+    let supervisor_network_audit_events = audit_state
+        .as_ref()
+        .map(|_| std::sync::Mutex::new(Vec::new()));
     if let Some(recorder_mutex) = audit_recorder.as_ref() {
         let mut recorder = recorder_mutex
             .lock()
@@ -206,6 +235,8 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         open_url_origins: &proxy.open_url_origins,
         open_url_allow_localhost: proxy.open_url_allow_localhost,
         audit_recorder: audit_recorder.as_ref(),
+        network_audit_events: supervisor_network_audit_events.as_ref(),
+        redaction_policy,
         allow_launch_services_active: proxy.allow_launch_services_active,
         #[cfg(target_os = "linux")]
         proxy_port: match caps.network_mode() {
@@ -216,6 +247,14 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         proxy_bind_ports: match caps.network_mode() {
             nono::NetworkMode::ProxyOnly { bind_ports, .. } => bind_ports.clone(),
             _ => Vec::new(),
+        },
+        #[cfg(target_os = "linux")]
+        unix_socket_allowlist: caps.unix_socket_capabilities(),
+        #[cfg(target_os = "linux")]
+        linux_network_notify_mode: if config.seccomp_proxy_fallback {
+            exec_strategy::LinuxNetworkNotifyMode::ProxyOnly
+        } else {
+            exec_strategy::LinuxNetworkNotifyMode::AfUnixOnly
         },
     };
 
@@ -244,10 +283,12 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         audit_snapshot_state,
         audit_tracked_paths,
         audit_recorder: audit_recorder.as_ref(),
+        supervisor_network_audit_events: supervisor_network_audit_events.as_ref(),
         audit_integrity_enabled: !rollback.no_audit_integrity,
         proxy_handle,
         executable_identity,
         audit_signer,
+        redaction_policy,
         started: &started,
         ended: &ended,
         command,
@@ -257,4 +298,22 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
     })?;
 
     Ok(exit_code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_open_supervised_pty;
+
+    #[test]
+    fn supervised_pty_is_used_for_attached_terminals() {
+        assert!(should_open_supervised_pty(false, true, true, true));
+        assert!(!should_open_supervised_pty(false, false, true, true));
+        assert!(!should_open_supervised_pty(false, true, false, true));
+        assert!(!should_open_supervised_pty(false, true, true, false));
+    }
+
+    #[test]
+    fn supervised_pty_is_always_used_for_detached_start() {
+        assert!(should_open_supervised_pty(true, false, false, false));
+    }
 }

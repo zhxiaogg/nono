@@ -5,10 +5,10 @@
 
 use crate::cli::SandboxArgs;
 use crate::policy;
-use crate::profile::{expand_vars, Profile};
+use crate::profile::{Profile, expand_vars};
 use crate::protected_paths::{self, ProtectedRoots};
 use nono::{
-    AccessMode, CapabilitySet, CapabilitySource, FsCapability, NonoError, Result,
+    AccessMode, CapabilitySet, CapabilitySource, FsCapability, NonoError, Result, SocketScope,
     UnixSocketCapability, UnixSocketMode,
 };
 use std::path::{Path, PathBuf};
@@ -62,13 +62,23 @@ fn try_new_unix_socket_file(
     }
 }
 
-/// Try to create a directory-scoped AF_UNIX socket capability.
-fn try_new_unix_socket_dir(
+/// Try to create a directory-backed AF_UNIX socket capability.
+fn try_new_unix_socket_dir_scoped(
     path: &Path,
     mode: UnixSocketMode,
+    scope: SocketScope,
     label: &str,
 ) -> Result<Option<UnixSocketCapability>> {
-    match UnixSocketCapability::new_dir(path, mode) {
+    let result = match scope {
+        SocketScope::DirChildren => UnixSocketCapability::new_dir(path, mode),
+        SocketScope::DirSubtree => UnixSocketCapability::new_dir_subtree(path, mode),
+        SocketScope::File => {
+            return Err(NonoError::SandboxInit(
+                "unix socket directory grant requires a directory scope".to_string(),
+            ));
+        }
+    };
+    match result {
         Ok(cap) => Ok(Some(cap)),
         Err(NonoError::PathNotFound(_)) => {
             info!("{}: {}", label, path.display());
@@ -78,7 +88,7 @@ fn try_new_unix_socket_dir(
     }
 }
 
-/// Apply all four `--allow-unix-socket*` flag groups to `caps`.
+/// Apply all `--allow-unix-socket*` flag groups to `caps`.
 ///
 /// Each flag adds a [`UnixSocketCapability`] and auto-registers the
 /// implied [`FsCapability`] (CLI-side sugar per #696). The socket-level
@@ -99,6 +109,9 @@ fn add_cli_unix_socket_caps(
     const LBL_FS_FILE_IMPLIED: &str = "Skipping implied fs grant for non-existent unix socket";
     const LBL_FS_DIR_IMPLIED: &str =
         "Skipping implied fs grant for non-existent unix socket directory";
+    const LBL_SOCK_SUBTREE: &str = "Skipping non-existent unix socket subtree (connect grant)";
+    const LBL_SOCK_SUBTREE_BIND: &str =
+        "Skipping non-existent unix socket subtree (connect+bind grant)";
     const LBL_FS_DIR_IMPLIED_BIND_PARENT: &str =
         "Skipping implied fs grant on parent of pending unix socket bind path";
 
@@ -155,21 +168,26 @@ fn add_cli_unix_socket_caps(
                 if let Some(cap) = try_new_file(path, AccessMode::ReadWrite, LBL_FS_FILE_IMPLIED)? {
                     caps.add_fs(cap);
                 }
-            } else if let Some(parent) = path.parent() {
-                if let Some(cap) = try_new_dir(
+            } else if let Some(parent) = path.parent()
+                && let Some(cap) = try_new_dir(
                     parent,
                     AccessMode::ReadWrite,
                     LBL_FS_DIR_IMPLIED_BIND_PARENT,
-                )? {
-                    caps.add_fs(cap);
-                }
+                )?
+            {
+                caps.add_fs(cap);
             }
         }
     }
 
     for path in &args.allow_unix_socket_dir {
         validate_requested_dir(path, "CLI", protected_roots, allow_parent_of_protected)?;
-        let sock_cap = try_new_unix_socket_dir(path, UnixSocketMode::Connect, LBL_SOCK_DIR)?;
+        let sock_cap = try_new_unix_socket_dir_scoped(
+            path,
+            UnixSocketMode::Connect,
+            SocketScope::DirChildren,
+            LBL_SOCK_DIR,
+        )?;
         if let Some(cap) = sock_cap {
             caps.add_unix_socket(cap);
             if let Some(cap) = try_new_dir(path, AccessMode::Read, LBL_FS_DIR_IMPLIED)? {
@@ -180,8 +198,44 @@ fn add_cli_unix_socket_caps(
 
     for path in &args.allow_unix_socket_dir_bind {
         validate_requested_dir(path, "CLI", protected_roots, allow_parent_of_protected)?;
-        let sock_cap =
-            try_new_unix_socket_dir(path, UnixSocketMode::ConnectBind, LBL_SOCK_DIR_BIND)?;
+        let sock_cap = try_new_unix_socket_dir_scoped(
+            path,
+            UnixSocketMode::ConnectBind,
+            SocketScope::DirChildren,
+            LBL_SOCK_DIR_BIND,
+        )?;
+        if let Some(cap) = sock_cap {
+            caps.add_unix_socket(cap);
+            if let Some(cap) = try_new_dir(path, AccessMode::ReadWrite, LBL_FS_DIR_IMPLIED)? {
+                caps.add_fs(cap);
+            }
+        }
+    }
+
+    for path in &args.allow_unix_socket_subtree {
+        validate_requested_dir(path, "CLI", protected_roots, allow_parent_of_protected)?;
+        let sock_cap = try_new_unix_socket_dir_scoped(
+            path,
+            UnixSocketMode::Connect,
+            SocketScope::DirSubtree,
+            LBL_SOCK_SUBTREE,
+        )?;
+        if let Some(cap) = sock_cap {
+            caps.add_unix_socket(cap);
+            if let Some(cap) = try_new_dir(path, AccessMode::Read, LBL_FS_DIR_IMPLIED)? {
+                caps.add_fs(cap);
+            }
+        }
+    }
+
+    for path in &args.allow_unix_socket_subtree_bind {
+        validate_requested_dir(path, "CLI", protected_roots, allow_parent_of_protected)?;
+        let sock_cap = try_new_unix_socket_dir_scoped(
+            path,
+            UnixSocketMode::ConnectBind,
+            SocketScope::DirSubtree,
+            LBL_SOCK_SUBTREE_BIND,
+        )?;
         if let Some(cap) = sock_cap {
             caps.add_unix_socket(cap);
             if let Some(cap) = try_new_dir(path, AccessMode::ReadWrite, LBL_FS_DIR_IMPLIED)? {
@@ -387,6 +441,17 @@ fn validate_requested_dir(
     protected_roots: &ProtectedRoots,
     allow_parent_of_protected: bool,
 ) -> Result<()> {
+    if path.exists() && !path.is_dir() {
+        return Err(NonoError::ConfigParse(format!(
+            "{} path '{}' is not a directory. \
+             Use --allow-file for single files.",
+            source,
+            path.display()
+        )));
+    }
+    if !path.exists() && source == "CLI" {
+        warn!("'{}' does not exist and will be ignored.", path.display());
+    }
     protected_paths::validate_requested_path_against_protected_roots(
         path,
         false,
@@ -751,11 +816,11 @@ impl CapabilitySetExt for CapabilitySet {
                         cap.source = CapabilitySource::Profile;
                         caps.add_fs(cap);
                     }
-                } else if let Some(parent) = path.parent() {
-                    if let Some(mut cap) = try_new_dir(parent, AccessMode::ReadWrite, &label)? {
-                        cap.source = CapabilitySource::Profile;
-                        caps.add_fs(cap);
-                    }
+                } else if let Some(parent) = path.parent()
+                    && let Some(mut cap) = try_new_dir(parent, AccessMode::ReadWrite, &label)?
+                {
+                    cap.source = CapabilitySource::Profile;
+                    caps.add_fs(cap);
                 }
             }
         }
@@ -772,8 +837,12 @@ impl CapabilitySetExt for CapabilitySet {
                 "Profile unix socket dir '{}' does not exist, skipping",
                 path_template
             );
-            if let Some(mut cap) = try_new_unix_socket_dir(&path, UnixSocketMode::Connect, &label)?
-            {
+            if let Some(mut cap) = try_new_unix_socket_dir_scoped(
+                &path,
+                UnixSocketMode::Connect,
+                SocketScope::DirChildren,
+                &label,
+            )? {
                 cap.source = CapabilitySource::Profile;
                 caps.add_unix_socket(cap);
                 if let Some(mut cap) = try_new_dir(&path, AccessMode::Read, &label)? {
@@ -795,9 +864,66 @@ impl CapabilitySetExt for CapabilitySet {
                 "Profile unix socket dir '{}' does not exist, skipping",
                 path_template
             );
-            if let Some(mut cap) =
-                try_new_unix_socket_dir(&path, UnixSocketMode::ConnectBind, &label)?
-            {
+            if let Some(mut cap) = try_new_unix_socket_dir_scoped(
+                &path,
+                UnixSocketMode::ConnectBind,
+                SocketScope::DirChildren,
+                &label,
+            )? {
+                cap.source = CapabilitySource::Profile;
+                caps.add_unix_socket(cap);
+                if let Some(mut cap) = try_new_dir(&path, AccessMode::ReadWrite, &label)? {
+                    cap.source = CapabilitySource::Profile;
+                    caps.add_fs(cap);
+                }
+            }
+        }
+
+        for path_template in &fs.unix_socket_subtree {
+            let path = expand_vars(path_template, workdir)?;
+            validate_requested_dir(
+                &path,
+                "Profile",
+                &protected_roots,
+                allow_parent_of_protected,
+            )?;
+            let label = format!(
+                "Profile unix socket subtree '{}' does not exist, skipping",
+                path_template
+            );
+            if let Some(mut cap) = try_new_unix_socket_dir_scoped(
+                &path,
+                UnixSocketMode::Connect,
+                SocketScope::DirSubtree,
+                &label,
+            )? {
+                cap.source = CapabilitySource::Profile;
+                caps.add_unix_socket(cap);
+                if let Some(mut cap) = try_new_dir(&path, AccessMode::Read, &label)? {
+                    cap.source = CapabilitySource::Profile;
+                    caps.add_fs(cap);
+                }
+            }
+        }
+
+        for path_template in &fs.unix_socket_subtree_bind {
+            let path = expand_vars(path_template, workdir)?;
+            validate_requested_dir(
+                &path,
+                "Profile",
+                &protected_roots,
+                allow_parent_of_protected,
+            )?;
+            let label = format!(
+                "Profile unix socket subtree '{}' does not exist, skipping",
+                path_template
+            );
+            if let Some(mut cap) = try_new_unix_socket_dir_scoped(
+                &path,
+                UnixSocketMode::ConnectBind,
+                SocketScope::DirSubtree,
+                &label,
+            )? {
                 cap.source = CapabilitySource::Profile;
                 caps.add_unix_socket(cap);
                 if let Some(mut cap) = try_new_dir(&path, AccessMode::ReadWrite, &label)? {
@@ -1101,6 +1227,7 @@ fn add_cli_overrides(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nono::SocketScope;
     use tempfile::tempdir;
 
     fn with_env_lock<T>(f: impl FnOnce() -> T) -> T {
@@ -2630,7 +2757,7 @@ mod tests {
         let socks = caps.unix_socket_capabilities();
         assert_eq!(socks.len(), 1);
         assert_eq!(socks[0].mode, UnixSocketMode::Connect);
-        assert!(!socks[0].is_directory);
+        assert!(!socks[0].is_directory());
 
         // Exactly one implied FsCapability at Read.
         let fs_matches: Vec<_> = caps
@@ -2719,7 +2846,7 @@ mod tests {
         let socks = caps.unix_socket_capabilities();
         assert_eq!(socks.len(), 1);
         assert_eq!(socks[0].mode, UnixSocketMode::ConnectBind);
-        assert!(!socks[0].is_directory);
+        assert!(!socks[0].is_directory());
 
         // Implied fs grant should cover the parent dir with ReadWrite.
         let canonical_parent = dir.path().canonicalize().expect("canonicalize dir");
@@ -2772,7 +2899,8 @@ mod tests {
         let socks = caps.unix_socket_capabilities();
         assert_eq!(socks.len(), 1);
         assert_eq!(socks[0].mode, UnixSocketMode::ConnectBind);
-        assert!(socks[0].is_directory);
+        assert!(socks[0].is_directory());
+        assert_eq!(socks[0].scope, SocketScope::DirChildren);
 
         let fs_match = caps
             .fs_capabilities()
@@ -2798,7 +2926,8 @@ mod tests {
         let socks = caps.unix_socket_capabilities();
         assert_eq!(socks.len(), 1);
         assert_eq!(socks[0].mode, UnixSocketMode::Connect);
-        assert!(socks[0].is_directory);
+        assert!(socks[0].is_directory());
+        assert_eq!(socks[0].scope, SocketScope::DirChildren);
 
         let fs_match = caps
             .fs_capabilities()
@@ -2808,6 +2937,58 @@ mod tests {
             })
             .expect("implied fs dir cap not found");
         assert_eq!(fs_match.access, AccessMode::Read);
+    }
+
+    #[test]
+    fn test_allow_unix_socket_subtree_implies_read_fs_grant() {
+        let dir = tempdir().expect("tempdir");
+
+        let args = SandboxArgs {
+            allow_unix_socket_subtree: vec![dir.path().to_path_buf()],
+            ..sandbox_args()
+        };
+
+        let (caps, _) = from_args_locked(&args).expect("from_args");
+
+        let socks = caps.unix_socket_capabilities();
+        assert_eq!(socks.len(), 1);
+        assert_eq!(socks[0].mode, UnixSocketMode::Connect);
+        assert_eq!(socks[0].scope, SocketScope::DirSubtree);
+
+        let fs_match = caps
+            .fs_capabilities()
+            .iter()
+            .find(|c| {
+                !c.is_file && c.resolved == dir.path().canonicalize().expect("canonicalize dir")
+            })
+            .expect("implied fs dir cap not found");
+        assert_eq!(fs_match.access, AccessMode::Read);
+    }
+
+    #[test]
+    fn test_allow_unix_socket_subtree_bind_implies_readwrite_fs_grant() {
+        let dir = tempdir().expect("tempdir");
+
+        let args = SandboxArgs {
+            allow_unix_socket_subtree_bind: vec![dir.path().to_path_buf()],
+            ..sandbox_args()
+        };
+
+        let (caps, _) = from_args_locked(&args).expect("from_args");
+
+        let socks = caps.unix_socket_capabilities();
+        assert_eq!(socks.len(), 1);
+        assert_eq!(socks[0].mode, UnixSocketMode::ConnectBind);
+        assert_eq!(socks[0].scope, SocketScope::DirSubtree);
+
+        let fs_match = caps
+            .fs_capabilities()
+            .iter()
+            .find(|c| {
+                !c.is_file && c.resolved == dir.path().canonicalize().expect("canonicalize dir")
+            })
+            .expect("implied fs dir cap not found");
+        assert_eq!(fs_match.access, AccessMode::ReadWrite);
     }
 
     /// Build a minimal profile JSON with a single filesystem field set,
@@ -2840,7 +3021,7 @@ mod tests {
             .collect();
         assert_eq!(socks.len(), 1);
         assert_eq!(socks[0].mode, UnixSocketMode::Connect);
-        assert!(!socks[0].is_directory);
+        assert!(!socks[0].is_directory());
     }
 
     #[test]
@@ -2860,7 +3041,7 @@ mod tests {
             .collect();
         assert_eq!(socks.len(), 1);
         assert_eq!(socks[0].mode, UnixSocketMode::ConnectBind);
-        assert!(!socks[0].is_directory);
+        assert!(!socks[0].is_directory());
     }
 
     #[test]
@@ -2878,7 +3059,7 @@ mod tests {
             .collect();
         assert_eq!(socks.len(), 1);
         assert_eq!(socks[0].mode, UnixSocketMode::Connect);
-        assert!(socks[0].is_directory);
+        assert!(socks[0].is_directory());
     }
 
     #[test]
@@ -2898,6 +3079,47 @@ mod tests {
             .collect();
         assert_eq!(socks.len(), 1);
         assert_eq!(socks[0].mode, UnixSocketMode::ConnectBind);
-        assert!(socks[0].is_directory);
+        assert!(socks[0].is_directory());
+        assert_eq!(socks[0].scope, SocketScope::DirChildren);
+    }
+
+    #[test]
+    fn test_profile_unix_socket_field_connect_subtree() {
+        let dir = tempdir().expect("tempdir");
+        let profile =
+            profile_with_fs_field("unix_socket_subtree", &dir.path().display().to_string());
+
+        let (caps, _) =
+            from_profile_locked(&profile, dir.path(), &sandbox_args()).expect("from_profile");
+
+        let socks: Vec<_> = caps
+            .unix_socket_capabilities()
+            .iter()
+            .filter(|c| c.source == CapabilitySource::Profile)
+            .collect();
+        assert_eq!(socks.len(), 1);
+        assert_eq!(socks[0].mode, UnixSocketMode::Connect);
+        assert_eq!(socks[0].scope, SocketScope::DirSubtree);
+    }
+
+    #[test]
+    fn test_profile_unix_socket_field_connect_bind_subtree() {
+        let dir = tempdir().expect("tempdir");
+        let profile = profile_with_fs_field(
+            "unix_socket_subtree_bind",
+            &dir.path().display().to_string(),
+        );
+
+        let (caps, _) =
+            from_profile_locked(&profile, dir.path(), &sandbox_args()).expect("from_profile");
+
+        let socks: Vec<_> = caps
+            .unix_socket_capabilities()
+            .iter()
+            .filter(|c| c.source == CapabilitySource::Profile)
+            .collect();
+        assert_eq!(socks.len(), 1);
+        assert_eq!(socks[0].mode, UnixSocketMode::ConnectBind);
+        assert_eq!(socks[0].scope, SocketScope::DirSubtree);
     }
 }

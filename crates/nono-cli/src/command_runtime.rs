@@ -2,8 +2,9 @@ use crate::cli::{RunArgs, SandboxArgs, ShellArgs, WrapArgs};
 use crate::exec_strategy;
 use crate::execution_runtime::execute_sandboxed;
 use crate::launch_runtime::{
-    load_configured_detach_sequence, prepare_run_launch_plan, resolve_requested_workdir,
-    select_exec_strategy, ExecutionFlags, LaunchPlan, SessionLaunchOptions,
+    ExecutionFlags, LaunchPlan, SessionLaunchOptions, load_configured_detach_sequence,
+    load_configured_redaction_policy, prepare_run_launch_plan, resolve_requested_workdir,
+    select_exec_strategy,
 };
 use crate::output;
 use crate::profile;
@@ -72,7 +73,8 @@ pub(crate) fn run_sandbox(mut run_args: RunArgs, silent: bool) -> Result<()> {
                 prepared.secrets.len()
             );
         }
-        output::print_dry_run(&program, &cmd_args, silent);
+        let redaction_policy = load_configured_redaction_policy()?;
+        output::print_dry_run(&program, &cmd_args, &redaction_policy, silent);
         return Ok(());
     }
 
@@ -99,7 +101,8 @@ pub(crate) fn run_shell(args: ShellArgs, silent: bool) -> Result<()> {
                 prepared.secrets.len()
             );
         }
-        output::print_dry_run(shell_path.as_os_str(), &[], silent);
+        let redaction_policy = load_configured_redaction_policy()?;
+        output::print_dry_run(shell_path.as_os_str(), &[], &redaction_policy, silent);
         return Ok(());
     }
 
@@ -141,9 +144,14 @@ pub(crate) fn run_shell(args: ShellArgs, silent: bool) -> Result<()> {
             capability_elevation: prepared.capability_elevation,
             #[cfg(target_os = "linux")]
             wsl2_proxy_policy: prepared.wsl2_proxy_policy,
+            #[cfg(target_os = "linux")]
+            af_unix_mediation: prepared.af_unix_mediation,
             bypass_protection_paths: prepared.bypass_protection_paths,
+            ignored_denial_paths: prepared.ignored_denial_paths,
             allowed_env_vars: prepared.allowed_env_vars,
+            denied_env_vars: prepared.denied_env_vars,
             proxy,
+            redaction_policy: load_configured_redaction_policy()?,
             session: SessionLaunchOptions {
                 session_name: args.name,
                 detach_sequence: load_configured_detach_sequence()?,
@@ -175,7 +183,8 @@ pub(crate) fn run_wrap(wrap_args: WrapArgs, silent: bool) -> Result<()> {
                 prepared.secrets.len()
             );
         }
-        output::print_dry_run(&program, &cmd_args, silent);
+        let redaction_policy = load_configured_redaction_policy()?;
+        output::print_dry_run(&program, &cmd_args, &redaction_policy, silent);
         return Ok(());
     }
 
@@ -190,6 +199,15 @@ pub(crate) fn run_wrap(wrap_args: WrapArgs, silent: bool) -> Result<()> {
         return Err(NonoError::ConfigParse(
             "nono wrap does not support proxy mode (activated by profile network settings). \
              Use `nono run` instead."
+                .to_string(),
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    if prepared.af_unix_mediation.is_pathname() {
+        return Err(NonoError::ConfigParse(
+            "nono wrap does not support linux.af_unix_mediation = \"pathname\" because direct \
+             exec cannot run the seccomp supervisor. Use `nono run` instead."
                 .to_string(),
         ));
     }
@@ -211,7 +229,9 @@ pub(crate) fn run_wrap(wrap_args: WrapArgs, silent: bool) -> Result<()> {
             workdir: resolve_requested_workdir(args.workdir.as_ref()),
             no_diagnostics,
             bypass_protection_paths: prepared.bypass_protection_paths,
+            ignored_denial_paths: prepared.ignored_denial_paths,
             allowed_env_vars: prepared.allowed_env_vars,
+            denied_env_vars: prepared.denied_env_vars,
             ..ExecutionFlags::defaults(silent)?
         },
     })

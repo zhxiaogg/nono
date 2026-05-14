@@ -18,8 +18,8 @@ use crate::startup_prompt::{print_terminal_safe_stderr, prompt_startup_terminati
 use crate::{DETACHED_CWD_PROMPT_RESPONSE_ENV, DETACHED_LAUNCH_ENV, DETACHED_SESSION_ID_ENV};
 use nix::libc;
 use nix::sys::signal::{self, Signal};
-use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-use nix::unistd::{fork, ForkResult, Pid};
+use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+use nix::unistd::{ForkResult, Pid, fork};
 use nono::supervisor::{ApprovalDecision, AuditEntry, SupervisorMessage, SupervisorResponse};
 use nono::{
     ApprovalBackend, CapabilitySet, DenialReason, DenialRecord, DiagnosticFormatter,
@@ -39,7 +39,7 @@ use tracing::{debug, info, warn};
 
 pub(crate) use env_sanitization::is_dangerous_env_var;
 use env_sanitization::should_skip_env_var;
-pub(crate) use env_sanitization::validate_allow_vars_pattern;
+pub(crate) use env_sanitization::validate_env_var_patterns;
 
 /// Resolve a program name to its absolute path.
 ///
@@ -69,32 +69,45 @@ const MAX_CRYPTO_THREADS: usize = 7;
 const MAX_DENIAL_RECORDS: usize = 1000;
 /// Hard cap on request IDs tracked for replay detection.
 const MAX_TRACKED_REQUEST_IDS: usize = 4096;
+/// Quiet period used to drain final PTY output after child exit before parent
+/// diagnostics/prompts take over the terminal.
+const POST_EXIT_PTY_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
+
+struct ProfileSaveOffer<'a> {
+    policy_explanations: &'a [nono::diagnostic::PolicyExplanation],
+    error_observation: &'a nono::diagnostic::ErrorObservation,
+    caps: &'a CapabilitySet,
+    command: &'a [String],
+    compared_profile: Option<&'a str>,
+    sandbox_violations: &'a [nono::SandboxViolation],
+    ignored_denial_paths: &'a [std::path::PathBuf],
+}
 
 fn offer_profile_save_for_child(
     pty: Option<&mut crate::pty_proxy::PtyProxy>,
-    policy_explanations: &[nono::diagnostic::PolicyExplanation],
-    error_observation: &nono::diagnostic::ErrorObservation,
-    caps: &CapabilitySet,
-    command: &[String],
-    compared_profile: Option<&str>,
+    offer: ProfileSaveOffer<'_>,
 ) -> Result<()> {
     if let Some(proxy) = pty {
         let _released_terminal = proxy.release_terminal_for_prompt();
         return crate::profile_save_runtime::offer_save_run_profile(
-            policy_explanations,
-            error_observation,
-            caps,
-            command,
-            compared_profile,
+            offer.policy_explanations,
+            offer.error_observation,
+            offer.caps,
+            offer.command,
+            offer.compared_profile,
+            offer.sandbox_violations,
+            offer.ignored_denial_paths,
         );
     }
 
     crate::profile_save_runtime::offer_save_run_profile(
-        policy_explanations,
-        error_observation,
-        caps,
-        command,
-        compared_profile,
+        offer.policy_explanations,
+        offer.error_observation,
+        offer.caps,
+        offer.command,
+        offer.compared_profile,
+        offer.sandbox_violations,
+        offer.ignored_denial_paths,
     )
 }
 
@@ -202,6 +215,8 @@ pub struct ExecConfig<'a> {
     pub protected_paths: &'a [std::path::PathBuf],
     /// Base profile name to derive a saved user patch from after run-time denials.
     pub profile_save_base: Option<&'a str>,
+    /// Denied paths that should not be offered in the save-profile prompt.
+    pub ignored_denial_paths: &'a [std::path::PathBuf],
     /// Optional startup timeout for known interactive CLIs that were launched
     /// without their recommended built-in profile.
     pub startup_timeout: Option<StartupTimeoutConfig<'a>>,
@@ -217,10 +232,17 @@ pub struct ExecConfig<'a> {
     /// sends the notify fd; parent expects to receive it.
     #[cfg(target_os = "linux")]
     pub seccomp_proxy_fallback: bool,
+    /// Linux pathname AF_UNIX mediation requested by profile.
+    #[cfg(target_os = "linux")]
+    pub af_unix_mediation: crate::profile::LinuxAfUnixMediation,
     /// Allow-list of environment variable names. When set, only variables
     /// matching an exact name or prefix pattern (e.g. `"AWS_*"`) are
     /// passed to the child. Nono-injected credentials always bypass this.
     pub allowed_env_vars: Option<Vec<String>>,
+    /// Deny-list of environment variable names. Variables matching an exact
+    /// name or prefix pattern (e.g. `"GITHUB_*"`) are stripped even if they
+    /// also appear in `allowed_env_vars`. Nono-injected credentials bypass this.
+    pub denied_env_vars: Option<Vec<String>>,
 }
 
 #[derive(Clone, Copy)]
@@ -255,6 +277,11 @@ pub struct SupervisorConfig<'a> {
     pub open_url_allow_localhost: bool,
     /// Optional append-only audit recorder for supervisor events.
     pub audit_recorder: Option<&'a Mutex<crate::audit_integrity::AuditRecorder>>,
+    /// Optional in-memory network/IPC audit events persisted into session metadata.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub network_audit_events: Option<&'a Mutex<Vec<nono::undo::NetworkAuditEvent>>>,
+    /// Redaction policy for command context in diagnostics.
+    pub redaction_policy: &'a nono::ScrubPolicy,
     /// Whether direct LaunchServices opening is enabled for this session.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub allow_launch_services_active: bool,
@@ -264,6 +291,21 @@ pub struct SupervisorConfig<'a> {
     /// Bind ports allowed for seccomp proxy-only fallback.
     #[cfg(target_os = "linux")]
     pub proxy_bind_ports: Vec<u16>,
+    /// Pathname AF_UNIX socket grants allowed for seccomp proxy-only fallback.
+    #[cfg(target_os = "linux")]
+    pub unix_socket_allowlist: &'a [nono::UnixSocketCapability],
+    /// Linux connect/bind seccomp notify policy mode.
+    #[cfg(target_os = "linux")]
+    pub linux_network_notify_mode: LinuxNetworkNotifyMode,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinuxNetworkNotifyMode {
+    /// V<4 proxy fallback: mediate TCP proxy ports and AF_UNIX sockets.
+    ProxyOnly,
+    /// V4+ opt-in: mediate pathname AF_UNIX only; let TCP continue.
+    AfUnixOnly,
 }
 
 #[cfg(target_os = "macos")]
@@ -272,11 +314,8 @@ fn should_install_macos_open_shim(supervisor: Option<&SupervisorConfig<'_>>) -> 
 }
 
 #[cfg(target_os = "linux")]
-const fn linux_child_requires_dumpable(
-    capability_elevation: bool,
-    seccomp_proxy_fallback: bool,
-) -> bool {
-    capability_elevation || seccomp_proxy_fallback
+const fn linux_child_requires_dumpable(capability_elevation: bool, network_notify: bool) -> bool {
+    capability_elevation || network_notify
 }
 
 /// Execute a command using the Direct strategy (exec, nono disappears).
@@ -309,10 +348,15 @@ pub fn execute_direct(config: &ExecConfig<'_>) -> Result<()> {
         ) {
             continue;
         }
-        if let Some(ref allowed) = config.allowed_env_vars {
-            if !env_sanitization::is_env_var_allowed(&key, allowed) {
-                continue;
-            }
+        if let Some(ref denied) = config.denied_env_vars
+            && env_sanitization::is_env_var_denied(&key, denied)
+        {
+            continue;
+        }
+        if let Some(ref allowed) = config.allowed_env_vars
+            && !env_sanitization::is_env_var_allowed(&key, allowed)
+        {
+            continue;
         }
         cmd.env(&key, &value);
     }
@@ -359,8 +403,9 @@ pub fn execute_direct(config: &ExecConfig<'_>) -> Result<()> {
 /// 4. Child: apply Landlock, install seccomp-notify, close inherited FDs, exec
 /// 5. Parent: apply PR_SET_DUMPABLE(0) + PT_DENY_ATTACH, receive seccomp fd, run supervisor loop
 ///
-/// Does NOT pipe stdout/stderr. The child inherits the parent's terminal directly,
-/// preserving TTY semantics for interactive programs (e.g., Claude Code, vim).
+/// When a PTY pair is provided, the child runs behind the PTY proxy so the
+/// parent can capture terminal output for diagnostics while the child still sees
+/// a TTY. Otherwise the child inherits the parent's terminal directly.
 /// The parent prints diagnostics and rollback UI after the child exits.
 pub fn execute_supervised(
     config: &ExecConfig<'_>,
@@ -403,6 +448,7 @@ pub fn execute_supervised(
     let needs_child_ipc = supervisor.is_some()
         && (config.capability_elevation
             || config.seccomp_proxy_fallback
+            || config.af_unix_mediation.is_pathname()
             || trust_interceptor.is_some());
 
     #[cfg(not(target_os = "linux"))]
@@ -437,10 +483,15 @@ pub fn execute_supervised(
             ) {
                 continue;
             }
-            if let Some(ref allowed) = config.allowed_env_vars {
-                if !env_sanitization::is_env_var_allowed(k, allowed) {
-                    continue;
-                }
+            if let Some(ref denied) = config.denied_env_vars
+                && env_sanitization::is_env_var_denied(k, denied)
+            {
+                continue;
+            }
+            if let Some(ref allowed) = config.allowed_env_vars
+                && !env_sanitization::is_env_var_allowed(k, allowed)
+            {
+                continue;
             }
             if let Ok(cstr) = CString::new(format!("{}={}", k, v)) {
                 env_c.push(cstr);
@@ -449,10 +500,10 @@ pub fn execute_supervised(
     }
 
     // Add NONO_CAP_FILE
-    if let Some(cap_file_str) = config.cap_file.to_str() {
-        if let Ok(cstr) = CString::new(format!("NONO_CAP_FILE={}", cap_file_str)) {
-            env_c.push(cstr);
-        }
+    if let Some(cap_file_str) = config.cap_file.to_str()
+        && let Ok(cstr) = CString::new(format!("NONO_CAP_FILE={}", cap_file_str))
+    {
+        env_c.push(cstr);
     }
 
     // Add user-specified environment variables (secrets, etc.)
@@ -476,46 +527,42 @@ pub fn execute_supervised(
     // `/usr/bin/open`. Seatbelt blocks that from launching URLs. Instead, we
     // create a shim script named `open` in a temp directory and prepend it to
     // PATH so the npm `open` package hits our shim first.
-    if supervisor.is_some() {
-        if let Ok(nono_exe) = std::env::current_exe() {
-            #[cfg(target_os = "linux")]
+    if supervisor.is_some()
+        && let Ok(nono_exe) = std::env::current_exe()
+    {
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(fd) = child_sock_fd
+                && let Some(shim) = create_linux_browser_shim(&nono_exe, fd)
             {
-                if let Some(fd) = child_sock_fd {
-                    if let Some(shim) = create_linux_browser_shim(&nono_exe, fd) {
-                        let browser_cmd = format!("BROWSER={}", shim.launcher.display());
-                        if let Ok(cstr) = CString::new(browser_cmd) {
-                            env_c.push(cstr);
-                        }
-                        browser_shim = Some(shim);
-                    }
+                let browser_cmd = format!("BROWSER={}", shim.launcher.display());
+                if let Ok(cstr) = CString::new(browser_cmd) {
+                    env_c.push(cstr);
                 }
+                browser_shim = Some(shim);
             }
+        }
 
-            #[cfg(target_os = "macos")]
-            {
-                if should_install_macos_open_shim(supervisor) {
-                    // Create a shim `open` script that delegates to nono open-url-helper.
-                    // The npm `open` package spawns `open <url>` on macOS; by placing our
-                    // shim earlier in PATH, we intercept the call.
-                    if let Some(fd) = child_sock_fd {
-                        if let Some(shim) = create_open_shim(&nono_exe, fd) {
-                            // Prepend shim dir to PATH and also set BROWSER for any tool
-                            // that does respect it.
-                            let current_path = std::env::var("PATH").unwrap_or_default();
-                            let new_path =
-                                format!("PATH={}:{current_path}", shim.dir.path().display());
-                            if let Ok(cstr) = CString::new(new_path) {
-                                // Remove existing PATH from env_c, then add our modified one
-                                env_c.retain(|c| !c.as_bytes().starts_with(b"PATH="));
-                                env_c.push(cstr);
-                            }
-                            let browser_cmd = format!("BROWSER={}", shim.launcher.display());
-                            if let Ok(cstr) = CString::new(browser_cmd) {
-                                env_c.push(cstr);
-                            }
-                            browser_shim = Some(shim);
-                        }
+        #[cfg(target_os = "macos")]
+        {
+            if should_install_macos_open_shim(supervisor) {
+                // Create a shim `open` script that delegates to nono open-url-helper.
+                // The npm `open` package spawns `open <url>` on macOS; by placing our
+                // shim earlier in PATH, we intercept the call.
+                if let Some(fd) = child_sock_fd
+                    && let Some(shim) = create_open_shim(&nono_exe, fd)
+                {
+                    let current_path = std::env::var("PATH").unwrap_or_default();
+                    let new_path = format!("PATH={}:{current_path}", shim.dir.path().display());
+                    if let Ok(cstr) = CString::new(new_path) {
+                        env_c.retain(|c| !c.as_bytes().starts_with(b"PATH="));
+                        env_c.push(cstr);
                     }
+                    let browser_cmd = format!("BROWSER={}", shim.launcher.display());
+                    if let Ok(cstr) = CString::new(browser_cmd) {
+                        env_c.push(cstr);
+                    }
+                    browser_shim = Some(shim);
                 }
             }
         }
@@ -646,21 +693,21 @@ pub fn execute_supervised(
             // and later into any helper (`open-url-helper`) that needs to speak
             // IPC back to the unsandboxed parent. `UnixStream::pair()` creates
             // fds with close-on-exec set, so clear it on the child end here.
-            if let Some(fd) = child_sock_fd {
-                if let Err(e) = clear_close_on_exec(fd) {
-                    let detail = format!(
-                        "nono: failed to clear close-on-exec on supervisor socket: {}\n",
-                        e
+            if let Some(fd) = child_sock_fd
+                && let Err(e) = clear_close_on_exec(fd)
+            {
+                let detail = format!(
+                    "nono: failed to clear close-on-exec on supervisor socket: {}\n",
+                    e
+                );
+                let msg = detail.as_bytes();
+                unsafe {
+                    libc::write(
+                        libc::STDERR_FILENO,
+                        msg.as_ptr().cast::<libc::c_void>(),
+                        msg.len(),
                     );
-                    let msg = detail.as_bytes();
-                    unsafe {
-                        libc::write(
-                            libc::STDERR_FILENO,
-                            msg.as_ptr().cast::<libc::c_void>(),
-                            msg.len(),
-                        );
-                        libc::_exit(126);
-                    }
+                    libc::_exit(126);
                 }
             }
 
@@ -735,92 +782,19 @@ pub fn execute_supervised(
                             msg.len(),
                         );
                     }
-                } else if config.capability_elevation {
-                    if let Some(fd) = child_sock_fd {
-                        match nono::sandbox::install_seccomp_notify() {
-                            Ok(notify_fd) => {
-                                if let Err(e) = nono::supervisor::socket::send_fd_via_socket(
-                                    fd,
-                                    notify_fd.as_raw_fd(),
-                                ) {
-                                    let detail = format!(
-                                        "nono: failed to send seccomp notify fd to supervisor: {}\n",
-                                        e
-                                    );
-                                    let msg = detail.as_bytes();
-                                    unsafe {
-                                        libc::write(
-                                            libc::STDERR_FILENO,
-                                            msg.as_ptr().cast::<libc::c_void>(),
-                                            msg.len(),
-                                        );
-                                        libc::_exit(126);
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                // seccomp not available -- proceed without transparent expansion
+                } else if config.capability_elevation
+                    && let Some(fd) = child_sock_fd
+                {
+                    match nono::sandbox::install_seccomp_notify() {
+                        Ok(notify_fd) => {
+                            if let Err(e) = nono::supervisor::socket::send_fd_via_socket(
+                                fd,
+                                notify_fd.as_raw_fd(),
+                            ) {
                                 let detail = format!(
-                                    "nono: seccomp-notify not available, expansion disabled: {}\n",
+                                    "nono: failed to send seccomp notify fd to supervisor: {}\n",
                                     e
                                 );
-                                let msg = detail.as_bytes();
-                                unsafe {
-                                    libc::write(
-                                        libc::STDERR_FILENO,
-                                        msg.as_ptr().cast::<libc::c_void>(),
-                                        msg.len(),
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // If the parent determined that seccomp proxy fallback is needed
-                // (Landlock ABI lacks AccessNet + ProxyOnly mode), install the
-                // proxy filter and send its notify fd to the parent.
-                // On WSL2 this flag should already be false (guarded in main.rs),
-                // but check again to avoid EBUSY / _exit(126).
-                if config.seccomp_proxy_fallback && nono::sandbox::is_wsl2() {
-                    let msg = b"nono: WSL2 detected, skipping seccomp proxy filter (proxy network filtering unavailable)\n";
-                    unsafe {
-                        libc::write(
-                            libc::STDERR_FILENO,
-                            msg.as_ptr().cast::<libc::c_void>(),
-                            msg.len(),
-                        );
-                    }
-                } else if config.seccomp_proxy_fallback {
-                    let has_bind = match effective_caps.network_mode() {
-                        nono::NetworkMode::ProxyOnly { bind_ports, .. } => !bind_ports.is_empty(),
-                        _ => false,
-                    };
-                    if let Some(fd) = child_sock_fd {
-                        match nono::sandbox::install_seccomp_proxy_filter(has_bind) {
-                            Ok(proxy_notify_fd) => {
-                                if let Err(e) = nono::supervisor::socket::send_fd_via_socket(
-                                    fd,
-                                    proxy_notify_fd.as_raw_fd(),
-                                ) {
-                                    let detail = format!(
-                                        "nono: failed to send proxy seccomp notify fd: {}\n",
-                                        e
-                                    );
-                                    let msg = detail.as_bytes();
-                                    unsafe {
-                                        libc::write(
-                                            libc::STDERR_FILENO,
-                                            msg.as_ptr().cast::<libc::c_void>(),
-                                            msg.len(),
-                                        );
-                                        libc::_exit(126);
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                let detail =
-                                    format!("nono: seccomp proxy filter not available: {}\n", e);
                                 let msg = detail.as_bytes();
                                 unsafe {
                                     libc::write(
@@ -832,12 +806,94 @@ pub fn execute_supervised(
                                 }
                             }
                         }
+                        Err(e) => {
+                            // seccomp not available -- proceed without transparent expansion
+                            let detail = format!(
+                                "nono: seccomp-notify not available, expansion disabled: {}\n",
+                                e
+                            );
+                            let msg = detail.as_bytes();
+                            unsafe {
+                                libc::write(
+                                    libc::STDERR_FILENO,
+                                    msg.as_ptr().cast::<libc::c_void>(),
+                                    msg.len(),
+                                );
+                            }
+                        }
+                    }
+                }
+
+                // If the parent determined that network seccomp-notify is
+                // needed, install exactly one connect/bind notify filter and
+                // send its fd to the parent. Proxy fallback uses the stricter
+                // proxy filter; V4+ AF_UNIX mediation uses an AF_UNIX-only
+                // policy filter that lets non-AF_UNIX traffic continue to the
+                // existing Landlock/network policy.
+                let install_network_notify =
+                    config.seccomp_proxy_fallback || config.af_unix_mediation.is_pathname();
+                if install_network_notify && nono::sandbox::is_wsl2() {
+                    let msg = b"nono: WSL2 detected, skipping seccomp proxy filter (proxy network filtering unavailable)\n";
+                    unsafe {
+                        libc::write(
+                            libc::STDERR_FILENO,
+                            msg.as_ptr().cast::<libc::c_void>(),
+                            msg.len(),
+                        );
+                    }
+                } else if install_network_notify && let Some(fd) = child_sock_fd {
+                    let notify_result = if config.seccomp_proxy_fallback {
+                        let has_bind = match effective_caps.network_mode() {
+                            nono::NetworkMode::ProxyOnly { bind_ports, .. } => {
+                                !bind_ports.is_empty()
+                            }
+                            _ => false,
+                        };
+                        nono::sandbox::install_seccomp_proxy_filter(has_bind)
+                    } else {
+                        nono::sandbox::install_seccomp_af_unix_filter()
+                    };
+
+                    match notify_result {
+                        Ok(proxy_notify_fd) => {
+                            if let Err(e) = nono::supervisor::socket::send_fd_via_socket(
+                                fd,
+                                proxy_notify_fd.as_raw_fd(),
+                            ) {
+                                let detail = format!(
+                                    "nono: failed to send proxy seccomp notify fd: {}\n",
+                                    e
+                                );
+                                let msg = detail.as_bytes();
+                                unsafe {
+                                    libc::write(
+                                        libc::STDERR_FILENO,
+                                        msg.as_ptr().cast::<libc::c_void>(),
+                                        msg.len(),
+                                    );
+                                    libc::_exit(126);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let detail =
+                                format!("nono: seccomp proxy filter not available: {}\n", e);
+                            let msg = detail.as_bytes();
+                            unsafe {
+                                libc::write(
+                                    libc::STDERR_FILENO,
+                                    msg.as_ptr().cast::<libc::c_void>(),
+                                    msg.len(),
+                                );
+                                libc::_exit(126);
+                            }
+                        }
                     }
                 }
 
                 if !linux_child_requires_dumpable(
                     config.capability_elevation,
-                    config.seccomp_proxy_fallback,
+                    config.seccomp_proxy_fallback || config.af_unix_mediation.is_pathname(),
                 ) {
                     use nix::sys::prctl;
 
@@ -1003,24 +1059,25 @@ pub fn execute_supervised(
             // receive the proxy notify fd from the child. Only attempt recv when
             // we know the child will send it (both sides use the same flag).
             #[cfg(target_os = "linux")]
-            let proxy_notify_fd: Option<OwnedFd> = if config.seccomp_proxy_fallback {
-                if let Some(ref sup_sock) = supervisor_sock {
-                    match sup_sock.recv_fd() {
-                        Ok(fd) => {
-                            debug!("Received proxy seccomp notify fd from child");
-                            Some(fd)
+            let proxy_notify_fd: Option<OwnedFd> =
+                if config.seccomp_proxy_fallback || config.af_unix_mediation.is_pathname() {
+                    if let Some(ref sup_sock) = supervisor_sock {
+                        match sup_sock.recv_fd() {
+                            Ok(fd) => {
+                                debug!("Received proxy seccomp notify fd from child");
+                                Some(fd)
+                            }
+                            Err(e) => {
+                                warn!("Failed to receive proxy seccomp notify fd: {}", e);
+                                None
+                            }
                         }
-                        Err(e) => {
-                            warn!("Failed to receive proxy seccomp notify fd: {}", e);
-                            None
-                        }
+                    } else {
+                        None
                     }
                 } else {
                     None
-                }
-            } else {
-                None
-            };
+                };
 
             // Set up signal forwarding.
             setup_signal_forwarding(child, pty_proxy.as_ref().map(|p| p.poll_fds().0));
@@ -1065,11 +1122,11 @@ pub fn execute_supervised(
                     .collect()
             };
 
-            let (status, denials) =
+            let (status, denials, ipc_denials) =
                 if let (Some(sup_cfg), Some(mut sup_sock)) = (supervisor, supervisor_sock) {
                     #[cfg(target_os = "linux")]
                     {
-                        run_supervisor_loop(
+                        let (status, denials, ipc_denials) = run_supervisor_loop(
                             child,
                             &mut sup_sock,
                             sup_cfg,
@@ -1079,23 +1136,25 @@ pub fn execute_supervised(
                             &initial_caps,
                             trust_interceptor,
                             pty_proxy.as_mut(),
-                        )?
+                        )?;
+                        (status, denials, ipc_denials)
                     }
                     #[cfg(not(target_os = "linux"))]
                     {
-                        run_supervisor_loop(
+                        let (status, denials) = run_supervisor_loop(
                             child,
                             &mut sup_sock,
                             sup_cfg,
                             config.startup_timeout,
                             trust_interceptor,
                             pty_proxy.as_mut(),
-                        )?
+                        )?;
+                        (status, denials, Vec::new())
                     }
                 } else {
                     let status =
                         wait_for_child_with_pty(child, pty_proxy.as_mut(), config.startup_timeout)?;
-                    (status, Vec::new())
+                    (status, Vec::new(), Vec::new())
                 };
 
             // Close the attach listener immediately so no new attach
@@ -1105,7 +1164,9 @@ pub fn execute_supervised(
             // attaching client gets EPIPE ("Broken pipe") when it
             // tries to send the handshake.
             if let Some(ref mut p) = pty_proxy {
+                p.drain_master_output(POST_EXIT_PTY_DRAIN_TIMEOUT);
                 p.shutdown_attach_listener();
+                p.release_terminal_for_prompt();
             }
 
             let exit_code = match status {
@@ -1148,23 +1209,41 @@ pub fn execute_supervised(
                 DiagnosticMode::Standard
             };
 
-            let should_print_diagnostics = !config.no_diagnostics
-                && (exit_code != 0 || !denials.is_empty() || error_observation.has_findings());
+            #[cfg(target_os = "macos")]
+            let sandbox_violations = if supervisor.is_some() {
+                let include_historical_sandbox_log =
+                    exit_code != 0 || !denials.is_empty() || error_observation.has_findings();
+                match sandbox_log_collector {
+                    Some(collector) if include_historical_sandbox_log => collector.finish(),
+                    Some(collector) => collector.finish_realtime_only(),
+                    None => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            };
+            #[cfg(not(target_os = "macos"))]
+            let sandbox_violations = Vec::new();
+
+            // Resolve policy explanations for denied paths so the diagnostic
+            // can show group names and fix guidance inline. On macOS this is
+            // also the source for the run-time profile save prompt.
+            let policy_explanations =
+                build_policy_explanations(&denials, &sandbox_violations, config.caps);
+            let prompt_policy_explanations = policy_explanations.clone();
+            let prompt_error_observation = error_observation.clone();
+
+            let should_print_diagnostics = should_print_diagnostic_footer(
+                config.no_diagnostics,
+                exit_code,
+                &denials,
+                &ipc_denials,
+                &sandbox_violations,
+                &error_observation,
+            );
 
             // Print diagnostic footer on non-zero exit or when the PTY
-            // output shows a likely sandbox-related issue.
+            // output or OS sandbox logs show a likely sandbox-related issue.
             if should_print_diagnostics {
-                #[cfg(target_os = "macos")]
-                let sandbox_violations = if supervisor.is_some() {
-                    sandbox_log_collector
-                        .map(crate::sandbox_log::SandboxLogCollector::finish)
-                        .unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
-                #[cfg(not(target_os = "macos"))]
-                let sandbox_violations = Vec::new();
-
                 let diag_session_id = if supervisor.is_some() {
                     pty_session_id
                         .or_else(|| supervisor.map(|s| s.session_id))
@@ -1173,16 +1252,18 @@ pub fn execute_supervised(
                     None
                 };
 
-                // Resolve policy explanations for denied paths so the
-                // diagnostic can show group names and fix guidance inline.
-                let policy_explanations =
-                    build_policy_explanations(&denials, &sandbox_violations, config.caps);
-                let prompt_policy_explanations = policy_explanations.clone();
-                let prompt_error_observation = error_observation.clone();
+                let default_redaction_policy;
+                let redaction_policy = if let Some(supervisor_config) = supervisor {
+                    supervisor_config.redaction_policy
+                } else {
+                    default_redaction_policy = nono::ScrubPolicy::secure_default();
+                    &default_redaction_policy
+                };
 
                 let mut formatter = DiagnosticFormatter::new(config.caps)
                     .with_mode(mode)
                     .with_denials(&denials)
+                    .with_ipc_denials(&ipc_denials)
                     .with_sandbox_violations(&sandbox_violations)
                     .with_protected_paths(config.protected_paths)
                     .with_error_observation(error_observation)
@@ -1193,26 +1274,36 @@ pub fn execute_supervised(
                     formatter = formatter.with_command(nono::diagnostic::CommandContext {
                         program: program.clone(),
                         resolved_path: config.resolved_program.to_path_buf(),
-                        args: config.command.to_vec(),
+                        args: nono::scrub_argv_with_policy(config.command, redaction_policy),
                     });
                 }
                 let footer = formatter.format_footer(exit_code);
                 crate::output::print_diagnostic_footer(&footer);
+            }
 
-                if exit_code != 0 {
-                    // Clear the forwarding target before prompting. The child is
-                    // already dead; keeping CHILD_PID set would cause forward_signal
-                    // to send Ctrl-C to the dead PID, swallowing it silently.
-                    clear_signal_forwarding_target();
-                    offer_profile_save_for_child(
-                        pty_proxy.as_mut(),
-                        &prompt_policy_explanations,
-                        &prompt_error_observation,
-                        config.caps,
-                        config.command,
-                        config.profile_save_base,
-                    )?;
-                }
+            if should_offer_profile_save(
+                config.no_diagnostics,
+                exit_code,
+                &prompt_policy_explanations,
+                &prompt_error_observation,
+                &sandbox_violations,
+            ) {
+                // Clear the forwarding target before prompting. The child is
+                // already dead; keeping CHILD_PID set would cause forward_signal
+                // to send Ctrl-C to the dead PID, swallowing it silently.
+                clear_signal_forwarding_target();
+                offer_profile_save_for_child(
+                    pty_proxy.as_mut(),
+                    ProfileSaveOffer {
+                        policy_explanations: &prompt_policy_explanations,
+                        error_observation: &prompt_error_observation,
+                        caps: config.caps,
+                        command: config.command,
+                        compared_profile: config.profile_save_base,
+                        sandbox_violations: &sandbox_violations,
+                        ignored_denial_paths: config.ignored_denial_paths,
+                    },
+                )?;
             }
 
             Ok(exit_code)
@@ -1231,8 +1322,8 @@ fn build_policy_explanations(
     sandbox_violations: &[nono::SandboxViolation],
     caps: &nono::CapabilitySet,
 ) -> Vec<nono::diagnostic::PolicyExplanation> {
-    use nono::diagnostic::PolicyExplanation;
     use nono::AccessMode;
+    use nono::diagnostic::PolicyExplanation;
     use std::collections::BTreeMap;
 
     // Merge access modes per path so a path denied for both Read and Write
@@ -1270,6 +1361,15 @@ fn build_policy_explanations(
             .or_insert(access);
     }
 
+    if has_keychain_service_violation(sandbox_violations)
+        && let Some(path) = login_keychain_db_path()
+    {
+        paths
+            .entry(path)
+            .and_modify(|a| *a = merge(*a, AccessMode::Read))
+            .or_insert(AccessMode::Read);
+    }
+
     let mut explanations = Vec::new();
     for (path, access) in paths {
         match crate::query_ext::query_path(&path, access, caps, &[]) {
@@ -1293,11 +1393,70 @@ fn build_policy_explanations(
                 // Path is actually allowed by policy — the denial came from
                 // a different layer (e.g. Landlock timing). Skip.
             }
-            Ok(crate::query_ext::QueryResult::NotSandboxed { .. }) | Err(_) => {}
+            Ok(crate::query_ext::QueryResult::NotSandboxed { .. })
+            | Ok(crate::query_ext::QueryResult::Scope { .. })
+            | Err(_) => {}
         }
     }
 
     explanations
+}
+
+fn has_keychain_service_violation(violations: &[nono::SandboxViolation]) -> bool {
+    violations.iter().any(|violation| {
+        violation.operation == "mach-lookup"
+            && violation
+                .target
+                .as_deref()
+                .is_some_and(is_keychain_service_name)
+    })
+}
+
+fn is_keychain_service_name(service: &str) -> bool {
+    matches!(
+        service,
+        "com.apple.SecurityServer"
+            | "com.apple.securityd"
+            | "com.apple.security.keychaind"
+            | "com.apple.secd"
+            | "com.apple.security.agent"
+    )
+}
+
+fn login_keychain_db_path() -> Option<PathBuf> {
+    crate::config::validated_home()
+        .ok()
+        .map(|home| PathBuf::from(home).join("Library/Keychains/login.keychain-db"))
+}
+
+fn should_print_diagnostic_footer(
+    no_diagnostics: bool,
+    exit_code: i32,
+    denials: &[nono::diagnostic::DenialRecord],
+    ipc_denials: &[nono::diagnostic::IpcDenialRecord],
+    sandbox_violations: &[nono::SandboxViolation],
+    error_observation: &nono::diagnostic::ErrorObservation,
+) -> bool {
+    !no_diagnostics
+        && (exit_code != 0
+            || !denials.is_empty()
+            || !ipc_denials.is_empty()
+            || !sandbox_violations.is_empty()
+            || error_observation.has_findings())
+}
+
+fn should_offer_profile_save(
+    no_diagnostics: bool,
+    exit_code: i32,
+    policy_explanations: &[nono::diagnostic::PolicyExplanation],
+    error_observation: &nono::diagnostic::ErrorObservation,
+    sandbox_violations: &[nono::SandboxViolation],
+) -> bool {
+    !no_diagnostics
+        && (exit_code != 0
+            || !policy_explanations.is_empty()
+            || !error_observation.path_hints.is_empty()
+            || crate::profile_save_runtime::has_saveable_system_service_rules(sandbox_violations))
 }
 
 /// Close inherited file descriptors, keeping stdin/stdout/stderr and specified FDs.
@@ -1402,7 +1561,7 @@ fn wait_for_child_with_pty(
         match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::StillAlive) => {
                 if let Some((deadline, timeout_cfg)) = startup_deadline {
-                    let has_output = pty.has_observed_output();
+                    let has_output = pty.has_visible_output();
                     if Instant::now() >= deadline && !has_output && !startup_prompted {
                         startup_prompted = true;
                         let terminate = prompt_startup_termination_for_child(
@@ -1449,13 +1608,14 @@ fn wait_for_child_with_startup_timeout(
     loop {
         match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::StillAlive) => {
-                if let Some((deadline, timeout_cfg)) = startup_deadline {
-                    if Instant::now() >= deadline && !startup_prompted {
-                        startup_prompted = true;
-                        if prompt_startup_termination_for_child(child, timeout_cfg, true, None) {
-                            let _ = signal::kill(child, Signal::SIGKILL);
-                            return wait_for_child(child);
-                        }
+                if let Some((deadline, timeout_cfg)) = startup_deadline
+                    && Instant::now() >= deadline
+                    && !startup_prompted
+                {
+                    startup_prompted = true;
+                    if prompt_startup_termination_for_child(child, timeout_cfg, true, None) {
+                        let _ = signal::kill(child, Signal::SIGKILL);
+                        return wait_for_child(child);
                     }
                 }
                 std::thread::sleep(Duration::from_millis(200));
@@ -1544,13 +1704,13 @@ fn setup_signal_forwarding(child: Pid, pty_master_fd: Option<i32>) {
             }
         }
 
-        if pty_master_fd.is_some() {
-            if let Err(e) = signal::signal(
+        if pty_master_fd.is_some()
+            && let Err(e) = signal::signal(
                 Signal::SIGWINCH,
                 signal::SigHandler::Handler(forward_signal),
-            ) {
-                debug!("Failed to install SIGWINCH handler: {:?}", e);
-            }
+            )
+        {
+            debug!("Failed to install SIGWINCH handler: {:?}", e);
         }
     }
 }
@@ -1650,8 +1810,8 @@ fn detach_client_for_session(pty: &mut crate::pty_proxy::PtyProxy) -> bool {
     pty.detach()
 }
 
-fn restore_terminal_after_detach() {
-    crate::pty_proxy::write_detach_terminal_reset(libc::STDOUT_FILENO);
+fn restore_terminal_after_detach(in_alt_screen: bool) {
+    crate::pty_proxy::write_detach_terminal_reset(libc::STDOUT_FILENO, in_alt_screen);
     crate::pty_proxy::write_detach_notice(libc::STDERR_FILENO);
 }
 
@@ -1663,7 +1823,9 @@ fn handle_pty_poll_events(
     resize_revents: libc::c_short,
     loop_name: &str,
 ) -> bool {
-    if master_revents & libc::POLLIN != 0 && !pty.proxy_master_to_client() {
+    if master_revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+        && !pty.proxy_master_to_client()
+    {
         debug!("Stopping {loop_name} after PTY master relay failure");
         return false;
     }
@@ -1691,8 +1853,13 @@ fn handle_pty_detach_request(
     if in_band_detach_requested {
         info!("PTY detach requested via in-band key sequence");
     }
-    if (pause_requested || in_band_detach_requested) && pty.is_some_and(detach_client_for_session) {
-        restore_terminal_after_detach();
+    if let Some(p) = pty
+        && (pause_requested || in_band_detach_requested)
+    {
+        let in_alt_screen = p.in_alt_screen();
+        if detach_client_for_session(p) {
+            restore_terminal_after_detach(in_alt_screen);
+        }
     }
 }
 
@@ -1842,17 +2009,17 @@ fn run_supervisor_loop(
                 }
             }
 
-            if let Some(ref mut p) = pty {
-                if !handle_pty_poll_events(
+            if let Some(ref mut p) = pty
+                && !handle_pty_poll_events(
                     p,
                     pfds[1].revents,
                     pfds[2].revents,
                     pfds[3].revents,
                     pfds[4].revents,
                     "supervisor loop",
-                ) {
-                    break;
-                }
+                )
+            {
+                break;
             }
         } else if ret < 0 {
             let err = std::io::Error::last_os_error();
@@ -1863,10 +2030,10 @@ fn run_supervisor_loop(
         }
 
         let pause_requested = drain_pause_pipe();
-        if let Some(ref mut p) = pty {
-            if pause_requested {
-                p.sync_current_terminal_winsize();
-            }
+        if let Some(ref mut p) = pty
+            && pause_requested
+        {
+            p.sync_current_terminal_winsize();
         }
         let in_band_detach_requested = pty.as_mut().is_some_and(|p| p.take_detach_request());
         handle_pty_detach_request(
@@ -1878,7 +2045,7 @@ fn run_supervisor_loop(
         match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::StillAlive) => {
                 if let Some((deadline, timeout_cfg)) = startup_deadline {
-                    let has_output = pty.as_ref().is_some_and(|p| p.has_observed_output());
+                    let has_output = pty.as_ref().is_some_and(|p| p.has_visible_output());
                     if Instant::now() >= deadline && !has_output && !startup_prompted {
                         startup_prompted = true;
                         let terminate = prompt_startup_termination_for_child(
@@ -1951,12 +2118,17 @@ fn run_supervisor_loop(
     initial_caps: &[supervisor_linux::InitialCapability],
     mut trust_interceptor: Option<crate::trust_intercept::TrustInterceptor>,
     mut pty: Option<&mut crate::pty_proxy::PtyProxy>,
-) -> Result<(WaitStatus, Vec<DenialRecord>)> {
+) -> Result<(
+    WaitStatus,
+    Vec<DenialRecord>,
+    Vec<nono::diagnostic::IpcDenialRecord>,
+)> {
     let sock_fd = sock.as_raw_fd();
     let notify_raw_fd = seccomp_fd.map(|fd| fd.as_raw_fd());
     let proxy_notify_raw_fd = proxy_seccomp_fd.map(|fd| fd.as_raw_fd());
     let mut rate_limiter = supervisor_linux::RateLimiter::new(10, 5);
     let mut denials = Vec::new();
+    let mut ipc_denials = Vec::new();
     let mut seen_request_ids = HashSet::new();
     let mut sock_fd_active = true;
     let startup_deadline = startup_timeout.map(|cfg| (Instant::now() + cfg.timeout, cfg));
@@ -2051,49 +2223,47 @@ fn run_supervisor_loop(
                     }
                 }
 
-                if let Some(notify_idx) = notify_idx {
-                    if pfds[notify_idx].revents & libc::POLLIN != 0 {
-                        if let Some(nfd) = notify_raw_fd {
-                            if let Err(e) = supervisor_linux::handle_seccomp_notification(
-                                nfd,
-                                child,
-                                config,
-                                initial_caps,
-                                &mut rate_limiter,
-                                &mut denials,
-                                trust_interceptor.as_mut(),
-                            ) {
-                                debug!("Error handling seccomp notification: {}", e);
-                            }
-                        }
-                    }
+                if let Some(notify_idx) = notify_idx
+                    && pfds[notify_idx].revents & libc::POLLIN != 0
+                    && let Some(nfd) = notify_raw_fd
+                    && let Err(e) = supervisor_linux::handle_seccomp_notification(
+                        nfd,
+                        child,
+                        config,
+                        initial_caps,
+                        &mut rate_limiter,
+                        &mut denials,
+                        trust_interceptor.as_mut(),
+                    )
+                {
+                    debug!("Error handling seccomp notification: {}", e);
                 }
 
-                if let Some(proxy_notify_idx) = proxy_notify_idx {
-                    if pfds[proxy_notify_idx].revents & libc::POLLIN != 0 {
-                        if let Some(pfd) = proxy_notify_raw_fd {
-                            if let Err(e) = supervisor_linux::handle_network_notification(
-                                pfd,
-                                config,
-                                &mut rate_limiter,
-                            ) {
-                                debug!("Error handling proxy seccomp notification: {}", e);
-                            }
-                        }
-                    }
+                if let Some(proxy_notify_idx) = proxy_notify_idx
+                    && pfds[proxy_notify_idx].revents & libc::POLLIN != 0
+                    && let Some(pfd) = proxy_notify_raw_fd
+                    && let Err(e) = supervisor_linux::handle_network_notification(
+                        pfd,
+                        config,
+                        &mut rate_limiter,
+                        &mut denials,
+                        &mut ipc_denials,
+                    )
+                {
+                    debug!("Error handling proxy seccomp notification: {}", e);
                 }
 
-                if let Some(ref mut p) = pty {
-                    if !handle_pty_poll_events(
+                if let Some(ref mut p) = pty
+                    && !handle_pty_poll_events(
                         p,
                         pfds[pty_base_idx].revents,
                         pfds[pty_base_idx + 1].revents,
                         pfds[pty_base_idx + 2].revents,
                         pfds[pty_base_idx + 3].revents,
                         "supervisor loop",
-                    ) {
-                        break;
-                    }
+                    )
+                {
+                    break;
                 }
             }
             std::cmp::Ordering::Less => {
@@ -2107,10 +2277,10 @@ fn run_supervisor_loop(
         }
 
         let pause_requested = drain_pause_pipe();
-        if let Some(ref mut p) = pty {
-            if pause_requested {
-                p.sync_current_terminal_winsize();
-            }
+        if let Some(ref mut p) = pty
+            && pause_requested
+        {
+            p.sync_current_terminal_winsize();
         }
         let in_band_detach_requested = pty.as_mut().is_some_and(|p| p.take_detach_request());
         handle_pty_detach_request(
@@ -2122,7 +2292,7 @@ fn run_supervisor_loop(
         match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::StillAlive) => {
                 if let Some((deadline, timeout_cfg)) = startup_deadline {
-                    let has_output = pty.as_ref().is_some_and(|p| p.has_observed_output());
+                    let has_output = pty.as_ref().is_some_and(|p| p.has_visible_output());
                     if Instant::now() >= deadline && !has_output && !startup_prompted {
                         startup_prompted = true;
                         let terminate = prompt_startup_termination_for_child(
@@ -2133,7 +2303,7 @@ fn run_supervisor_loop(
                         );
                         if terminate {
                             let _ = signal::kill(child, Signal::SIGTERM);
-                            return Ok((wait_for_child(child)?, denials));
+                            return Ok((wait_for_child(child)?, denials, ipc_denials));
                         }
                     }
                 }
@@ -2147,11 +2317,27 @@ fn run_supervisor_loop(
                 debug!("Child continued, keeping supervisor alive");
                 continue;
             }
-            Ok(status) => return Ok((status, denials)),
+            Ok(status) => {
+                drain_pending_network_notifications(
+                    proxy_notify_raw_fd,
+                    config,
+                    &mut rate_limiter,
+                    &mut denials,
+                    &mut ipc_denials,
+                );
+                return Ok((status, denials, ipc_denials));
+            }
             Err(nix::errno::Errno::EINTR) => continue,
             Err(nix::errno::Errno::ECHILD) => {
                 warn!("Child already reaped in supervisor loop");
-                return Ok((WaitStatus::Exited(child, 1), denials));
+                drain_pending_network_notifications(
+                    proxy_notify_raw_fd,
+                    config,
+                    &mut rate_limiter,
+                    &mut denials,
+                    &mut ipc_denials,
+                );
+                return Ok((WaitStatus::Exited(child, 1), denials, ipc_denials));
             }
             Err(e) => {
                 return Err(NonoError::SandboxInit(format!(
@@ -2163,7 +2349,42 @@ fn run_supervisor_loop(
     }
 
     let status = wait_for_child(child)?;
-    Ok((status, denials))
+    Ok((status, denials, ipc_denials))
+}
+
+#[cfg(target_os = "linux")]
+fn drain_pending_network_notifications(
+    proxy_notify_raw_fd: Option<std::os::fd::RawFd>,
+    config: &SupervisorConfig<'_>,
+    rate_limiter: &mut supervisor_linux::RateLimiter,
+    denials: &mut Vec<DenialRecord>,
+    ipc_denials: &mut Vec<nono::diagnostic::IpcDenialRecord>,
+) {
+    let Some(fd) = proxy_notify_raw_fd else {
+        return;
+    };
+
+    loop {
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ret = unsafe { libc::poll(&mut pfd, 1, 0) };
+        if ret <= 0 || pfd.revents & libc::POLLIN == 0 {
+            return;
+        }
+        if let Err(err) = supervisor_linux::handle_network_notification(
+            fd,
+            config,
+            rate_limiter,
+            denials,
+            ipc_denials,
+        ) {
+            debug!("Error draining pending proxy seccomp notification: {}", err);
+            return;
+        }
+    }
 }
 
 /// Handle a single supervisor IPC message.
@@ -2866,13 +3087,13 @@ fn validate_procfs_access(
         )));
     }
 
-    if let Some(component) = sensitive_component {
-        if SELF_BLOCKED_PROC_NAMES.contains(&component) {
-            return Err(OpenPathError::policy_blocked(format!(
-                "Access to {} is blocked by policy",
-                resolved_path.display(),
-            )));
-        }
+    if let Some(component) = sensitive_component
+        && SELF_BLOCKED_PROC_NAMES.contains(&component)
+    {
+        return Err(OpenPathError::policy_blocked(format!(
+            "Access to {} is blocked by policy",
+            resolved_path.display(),
+        )));
     }
 
     Ok(())
@@ -3166,12 +3387,16 @@ mod tests {
 
         crate::profile_save_runtime::configure_prompt_termios(&mut termios);
 
-        assert!(termios
-            .input_flags
-            .contains(InputFlags::ICRNL | InputFlags::IXON));
-        assert!(!termios
-            .input_flags
-            .intersects(InputFlags::IGNBRK | InputFlags::INLCR | InputFlags::IGNCR));
+        assert!(
+            termios
+                .input_flags
+                .contains(InputFlags::ICRNL | InputFlags::IXON)
+        );
+        assert!(
+            !termios
+                .input_flags
+                .intersects(InputFlags::IGNBRK | InputFlags::INLCR | InputFlags::IGNCR)
+        );
         assert!(termios.output_flags.contains(OutputFlags::OPOST));
         assert!(termios.local_flags.contains(
             LocalFlags::ECHO
@@ -3190,6 +3415,120 @@ mod tests {
             termios.control_chars[SpecialCharacterIndices::VTIME as usize],
             0
         );
+    }
+
+    #[test]
+    fn test_diagnostic_footer_triggers_on_successful_sandbox_violation() {
+        let violations = vec![nono::SandboxViolation {
+            operation: "file-read-data".to_string(),
+            target: Some("/tmp/secret.txt".to_string()),
+        }];
+        let denials = Vec::new();
+        let observation = nono::diagnostic::ErrorObservation::default();
+
+        assert!(should_print_diagnostic_footer(
+            false,
+            0,
+            &denials,
+            &[],
+            &violations,
+            &observation,
+        ));
+        assert!(!should_print_diagnostic_footer(
+            true,
+            0,
+            &denials,
+            &[],
+            &violations,
+            &observation,
+        ));
+    }
+
+    #[test]
+    fn test_profile_save_prompt_triggers_on_policy_explanation_with_zero_exit() {
+        let explanations = vec![nono::diagnostic::PolicyExplanation {
+            path: PathBuf::from("/tmp/secret.txt"),
+            access: nono::AccessMode::Read,
+            reason: "path_not_granted".to_string(),
+            details: None,
+            policy_source: None,
+            suggested_flag: Some("--read-file /tmp/secret.txt".to_string()),
+        }];
+        let observation = nono::diagnostic::ErrorObservation::default();
+
+        assert!(should_offer_profile_save(
+            false,
+            0,
+            &explanations,
+            &observation,
+            &[],
+        ));
+    }
+
+    #[test]
+    fn test_profile_save_prompt_triggers_on_user_preferences_violation_with_zero_exit() {
+        let explanations = Vec::new();
+        let observation = nono::diagnostic::ErrorObservation::default();
+        let violations = vec![nono::SandboxViolation {
+            operation: "user-preference-read".to_string(),
+            target: Some("kcfpreferencesanyapplication".to_string()),
+        }];
+
+        assert!(should_offer_profile_save(
+            false,
+            0,
+            &explanations,
+            &observation,
+            &violations,
+        ));
+    }
+
+    #[test]
+    fn test_keychain_mach_violation_adds_profile_save_explanation() {
+        let _env_lock = crate::test_env::ENV_LOCK.lock().expect("env lock");
+        let temp_home = tempfile::TempDir::new().expect("temp home");
+        let home = temp_home.path().canonicalize().expect("canonical home");
+        let _env =
+            crate::test_env::EnvVarGuard::set_all(&[("HOME", home.to_str().expect("home path"))]);
+        let keychain = home.join("Library/Keychains/login.keychain-db");
+        std::fs::create_dir_all(keychain.parent().expect("keychain parent")).expect("mkdir");
+        std::fs::write(&keychain, b"db").expect("write keychain fixture");
+
+        let violations = vec![nono::SandboxViolation {
+            operation: "mach-lookup".to_string(),
+            target: Some("com.apple.SecurityServer".to_string()),
+        }];
+
+        let explanations = build_policy_explanations(&[], &violations, &nono::CapabilitySet::new());
+
+        let explanation = explanations
+            .iter()
+            .find(|explanation| explanation.path == keychain)
+            .expect("keychain explanation");
+        assert_eq!(explanation.access, nono::AccessMode::Read);
+        #[cfg(target_os = "macos")]
+        assert_eq!(explanation.reason, "sensitive_path");
+    }
+
+    #[test]
+    fn test_profile_save_prompt_preserves_nonzero_exit_behavior() {
+        let explanations = Vec::new();
+        let observation = nono::diagnostic::ErrorObservation::default();
+
+        assert!(should_offer_profile_save(
+            false,
+            1,
+            &explanations,
+            &observation,
+            &[],
+        ));
+        assert!(!should_offer_profile_save(
+            true,
+            1,
+            &explanations,
+            &observation,
+            &[],
+        ));
     }
 
     #[test]
@@ -3455,11 +3794,17 @@ mod tests {
             open_url_origins: &[],
             open_url_allow_localhost: false,
             audit_recorder: None,
+            network_audit_events: None,
+            redaction_policy: &nono::ScrubPolicy::secure_default(),
             allow_launch_services_active: false,
             #[cfg(target_os = "linux")]
             proxy_port: 0,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
+            #[cfg(target_os = "linux")]
+            unix_socket_allowlist: &[],
+            #[cfg(target_os = "linux")]
+            linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
         };
 
         // Fork a child that closes its socket end and exits immediately.
@@ -3496,10 +3841,19 @@ mod tests {
                     None, // no PTY relay
                 );
 
+                #[cfg(target_os = "linux")]
+                let (status, denials, ipc_denials) = result
+                    .map_err(|e| format!("supervisor loop: {e}"))
+                    .expect("supervisor loop failed");
+
+                #[cfg(not(target_os = "linux"))]
                 let (status, denials) = result
                     .map_err(|e| format!("supervisor loop: {e}"))
                     .expect("supervisor loop failed");
+
                 assert!(denials.is_empty(), "no denials expected");
+                #[cfg(target_os = "linux")]
+                assert!(ipc_denials.is_empty(), "no IPC denials expected");
 
                 // Child exited with code 42
                 match status {
@@ -3554,11 +3908,17 @@ mod tests {
             open_url_origins: &[],
             open_url_allow_localhost: false,
             audit_recorder: None,
+            network_audit_events: None,
+            redaction_policy: &nono::ScrubPolicy::secure_default(),
             allow_launch_services_active: false,
             #[cfg(target_os = "linux")]
             proxy_port: 8080,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
+            #[cfg(target_os = "linux")]
+            unix_socket_allowlist: &[],
+            #[cfg(target_os = "linux")]
+            linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
         };
 
         match unsafe { fork() } {
@@ -3587,10 +3947,11 @@ mod tests {
                     None, // no PTY relay
                 );
 
-                let (status, denials) = result
+                let (status, denials, ipc_denials) = result
                     .map_err(|e| format!("supervisor loop: {e}"))
                     .expect("supervisor loop should not deadlock");
                 assert!(denials.is_empty());
+                assert!(ipc_denials.is_empty());
 
                 match status {
                     WaitStatus::Exited(_, code) => assert_eq!(code, 0),
@@ -3629,11 +3990,17 @@ mod tests {
             open_url_origins: &origins,
             open_url_allow_localhost: false,
             audit_recorder: None,
+            network_audit_events: None,
+            redaction_policy: &nono::ScrubPolicy::secure_default(),
             allow_launch_services_active: false,
             #[cfg(target_os = "linux")]
             proxy_port: 0,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
+            #[cfg(target_os = "linux")]
+            unix_socket_allowlist: &[],
+            #[cfg(target_os = "linux")]
+            linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
         };
 
         // Allowed origin: validation passes
@@ -3643,11 +4010,13 @@ mod tests {
         // Disallowed origin: must fail validation
         let result = validate_url("https://evil.example.com/phishing", &config);
         assert!(result.is_err());
-        assert!(result
-            .as_ref()
-            .err()
-            .map(|e| e.contains("not in the profile"))
-            .unwrap_or(false));
+        assert!(
+            result
+                .as_ref()
+                .err()
+                .map(|e| e.contains("not in the profile"))
+                .unwrap_or(false)
+        );
     }
 
     #[test]
@@ -3662,20 +4031,28 @@ mod tests {
             open_url_origins: &[],
             open_url_allow_localhost: false,
             audit_recorder: None,
+            network_audit_events: None,
+            redaction_policy: &nono::ScrubPolicy::secure_default(),
             allow_launch_services_active: false,
             #[cfg(target_os = "linux")]
             proxy_port: 0,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
+            #[cfg(target_os = "linux")]
+            unix_socket_allowlist: &[],
+            #[cfg(target_os = "linux")]
+            linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
         };
 
         let result = validate_url("file:///etc/passwd", &config);
         assert!(result.is_err());
-        assert!(result
-            .as_ref()
-            .err()
-            .map(|e| e.contains("Only https://"))
-            .unwrap_or(false));
+        assert!(
+            result
+                .as_ref()
+                .err()
+                .map(|e| e.contains("Only https://"))
+                .unwrap_or(false)
+        );
 
         let result = validate_url("javascript:alert(1)", &config);
         assert!(result.is_err());
@@ -3693,11 +4070,17 @@ mod tests {
             open_url_origins: &[],
             open_url_allow_localhost: true,
             audit_recorder: None,
+            network_audit_events: None,
+            redaction_policy: &nono::ScrubPolicy::secure_default(),
             allow_launch_services_active: false,
             #[cfg(target_os = "linux")]
             proxy_port: 0,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
+            #[cfg(target_os = "linux")]
+            unix_socket_allowlist: &[],
+            #[cfg(target_os = "linux")]
+            linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
         };
         let config_deny = SupervisorConfig {
             protected_roots: &[],
@@ -3708,21 +4091,29 @@ mod tests {
             open_url_origins: &[],
             open_url_allow_localhost: false,
             audit_recorder: None,
+            network_audit_events: None,
+            redaction_policy: &nono::ScrubPolicy::secure_default(),
             allow_launch_services_active: false,
             #[cfg(target_os = "linux")]
             proxy_port: 0,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
+            #[cfg(target_os = "linux")]
+            unix_socket_allowlist: &[],
+            #[cfg(target_os = "linux")]
+            linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
         };
 
         // Localhost denied when not allowed
         let result = validate_url("http://localhost:8080/callback", &config_deny);
         assert!(result.is_err());
-        assert!(result
-            .as_ref()
-            .err()
-            .map(|e| e.contains("not allowed"))
-            .unwrap_or(false));
+        assert!(
+            result
+                .as_ref()
+                .err()
+                .map(|e| e.contains("not allowed"))
+                .unwrap_or(false)
+        );
 
         // Localhost allowed when configured
         let result = validate_url("http://localhost:8080/callback", &config_allow);
@@ -3744,21 +4135,29 @@ mod tests {
             open_url_origins: &[],
             open_url_allow_localhost: false,
             audit_recorder: None,
+            network_audit_events: None,
+            redaction_policy: &nono::ScrubPolicy::secure_default(),
             allow_launch_services_active: false,
             #[cfg(target_os = "linux")]
             proxy_port: 0,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
+            #[cfg(target_os = "linux")]
+            unix_socket_allowlist: &[],
+            #[cfg(target_os = "linux")]
+            linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
         };
 
         let long_url = format!("https://example.com/{}", "a".repeat(MAX_URL_LENGTH));
         let result = validate_url(&long_url, &config);
         assert!(result.is_err());
-        assert!(result
-            .as_ref()
-            .err()
-            .map(|e| e.contains("maximum length"))
-            .unwrap_or(false));
+        assert!(
+            result
+                .as_ref()
+                .err()
+                .map(|e| e.contains("maximum length"))
+                .unwrap_or(false)
+        );
     }
 
     #[test]
@@ -3883,11 +4282,17 @@ mod tests {
             open_url_origins: &[],
             open_url_allow_localhost: false,
             audit_recorder: None,
+            network_audit_events: None,
+            redaction_policy: &nono::ScrubPolicy::secure_default(),
             allow_launch_services_active: true,
             #[cfg(target_os = "linux")]
             proxy_port: 0,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
+            #[cfg(target_os = "linux")]
+            unix_socket_allowlist: &[],
+            #[cfg(target_os = "linux")]
+            linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
         };
 
         assert!(

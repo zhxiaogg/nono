@@ -31,6 +31,8 @@ pub enum DenialReason {
     RateLimited,
     /// Approval backend returned an error
     BackendError,
+    /// Pathname Unix socket was denied by IPC mediation
+    UnixSocketDenied,
 }
 
 /// Record of a denied access attempt during a supervised session.
@@ -42,6 +44,19 @@ pub struct DenialRecord {
     pub access: AccessMode,
     /// Why it was denied
     pub reason: DenialReason,
+}
+
+/// Record of a denied IPC attempt during a supervised session.
+#[derive(Debug, Clone)]
+pub struct IpcDenialRecord {
+    /// IPC resource that was denied, e.g. `/run/user/1000/bus` or `unix:<abstract>`.
+    pub target: String,
+    /// Operation attempted, e.g. `connect` or `bind`.
+    pub operation: String,
+    /// Why it was denied.
+    pub reason: String,
+    /// Suggested CLI flag when this denial can be fixed by an explicit grant.
+    pub suggested_flag: Option<String>,
 }
 
 /// Best-effort sandbox violation recovered from OS-native logging.
@@ -157,12 +172,12 @@ fn sanitize_for_diagnostic(s: &str) -> String {
     while let Some(c) = chars.next() {
         if c == '\x1b' {
             // Skip ESC and the entire escape sequence
-            if let Some(next) = chars.next() {
-                if next == '[' {
-                    for seq_char in chars.by_ref() {
-                        if seq_char.is_ascii_alphabetic() {
-                            break;
-                        }
+            if let Some(next) = chars.next()
+                && next == '['
+            {
+                for seq_char in chars.by_ref() {
+                    if seq_char.is_ascii_alphabetic() {
+                        break;
                     }
                 }
             }
@@ -186,6 +201,8 @@ pub fn analyze_error_output(
     let mut observed = std::collections::BTreeMap::<PathBuf, AccessMode>::new();
     let mut missing = std::collections::BTreeSet::<PathBuf>::new();
     let mut pending_relative_write: Option<PathBuf> = None;
+    let mut pending_structured_access_denial = false;
+    let mut pending_structured_access: Option<AccessMode> = None;
     let mut non_sandbox_failure = None;
 
     for line in error_output.lines() {
@@ -201,6 +218,29 @@ pub fn analyze_error_output(
             current_dir.and_then(|cwd| extract_relative_write_path_from_line(line, cwd))
         {
             pending_relative_write = Some(path);
+        }
+
+        if looks_like_structured_access_denial_code(line) {
+            pending_structured_access_denial = true;
+        }
+
+        if pending_structured_access_denial {
+            if let Some(access) = infer_access_from_structured_syscall_line(line) {
+                pending_structured_access = Some(access);
+            }
+
+            if let (Some(path), Some(access)) = (
+                extract_structured_path_property(line),
+                pending_structured_access,
+            ) {
+                observed
+                    .entry(path)
+                    .and_modify(|existing| *existing = merge_access_modes(*existing, access))
+                    .or_insert(access);
+                pending_structured_access_denial = false;
+                pending_structured_access = None;
+                continue;
+            }
         }
 
         if looks_like_missing_path(line) {
@@ -288,10 +328,10 @@ fn detect_protected_file_in_error_line(
     error_line: &str,
 ) -> Option<String> {
     for path in protected_paths {
-        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            if error_line.contains(name) {
-                return Some(name.to_string());
-            }
+        if let Some(name) = path.file_name().and_then(|n| n.to_str())
+            && error_line.contains(name)
+        {
+            return Some(name.to_string());
         }
     }
     None
@@ -302,6 +342,11 @@ fn looks_like_access_denial(line: &str) -> bool {
     lower.contains("operation not permitted")
         || lower.contains("permission denied")
         || lower.contains("read-only file system")
+}
+
+fn looks_like_structured_access_denial_code(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    (lower.contains("eperm") || lower.contains("eacces")) && looks_like_access_denial(line)
 }
 
 fn looks_like_missing_path(line: &str) -> bool {
@@ -344,6 +389,10 @@ fn format_command_succeeded_with_stderr_line() -> String {
 }
 
 fn extract_denied_path_from_error_line(line: &str) -> Option<PathBuf> {
+    if let Some(path) = extract_path_after_syscall_word(line) {
+        return Some(path);
+    }
+
     let denial_markers = [
         "Operation not permitted",
         "Permission denied",
@@ -361,7 +410,90 @@ fn extract_denied_path_from_error_line(line: &str) -> Option<PathBuf> {
         }
     }
 
-    extract_path_from_segment(prefix)
+    extract_path_from_segment(prefix).or_else(|| extract_path_from_segment(line))
+}
+
+fn extract_path_after_syscall_word(line: &str) -> Option<PathBuf> {
+    const MARKERS: &[&str] = &["mkdir", "mkdtemp", "open", "copyfile", "rename", "unlink"];
+
+    let lower = line.to_ascii_lowercase();
+    for marker in MARKERS {
+        let needle = format!("{marker} ");
+        let Some(idx) = lower.find(&needle) else {
+            continue;
+        };
+        let segment = line.get(idx + needle.len()..)?;
+        if let Some(path) = extract_path_from_segment(segment) {
+            return Some(path);
+        }
+    }
+
+    None
+}
+
+fn infer_access_from_structured_syscall_line(line: &str) -> Option<AccessMode> {
+    let syscall = extract_structured_string_property(line, "syscall")?;
+    Some(match syscall.to_ascii_lowercase().as_str() {
+        "mkdir" | "mkdtemp" | "rmdir" | "unlink" | "rename" | "write" | "copyfile" | "chmod"
+        | "chown" | "utimes" => AccessMode::Write,
+        _ => AccessMode::ReadWrite,
+    })
+}
+
+fn extract_structured_path_property(line: &str) -> Option<PathBuf> {
+    extract_structured_string_property(line, "path").map(PathBuf::from)
+}
+
+fn extract_structured_string_property(line: &str, key: &str) -> Option<String> {
+    let trimmed = line.trim();
+    let after_key = trimmed
+        .strip_prefix(key)
+        .or_else(|| trimmed.strip_prefix(&format!("\"{key}\"")))
+        .or_else(|| trimmed.strip_prefix(&format!("'{key}'")))?;
+    let after_colon = after_key.trim_start().strip_prefix(':')?.trim_start();
+    let quote = after_colon.chars().next()?;
+    if quote != '\'' && quote != '"' {
+        return None;
+    }
+    let after_quote = after_colon.get(quote.len_utf8()..)?;
+    let mut value = String::new();
+    let mut escaped = false;
+    let mut found_end = false;
+
+    for ch in after_quote.chars() {
+        if escaped {
+            if ch == quote || ch == '\\' {
+                value.push(ch);
+            } else {
+                value.push('\\');
+                value.push(ch);
+            }
+            escaped = false;
+            continue;
+        }
+
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+
+        if ch == quote {
+            found_end = true;
+            break;
+        }
+
+        value.push(ch);
+    }
+
+    if !found_end {
+        return None;
+    }
+
+    let value = value.trim();
+    if value.is_empty() || value.chars().any(char::is_control) {
+        return None;
+    }
+    Some(value.to_string())
 }
 
 fn extract_relative_write_path_from_line(line: &str, current_dir: &Path) -> Option<PathBuf> {
@@ -439,19 +571,23 @@ fn extract_path_from_segment(segment: &str) -> Option<PathBuf> {
 fn infer_access_from_error_line(line: &str, path: &Path) -> AccessMode {
     let lower = line.to_ascii_lowercase();
 
-    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-        if matches!(
+    if let Some(name) = path.file_name().and_then(|n| n.to_str())
+        && matches!(
             name,
             ".profile" | ".bash_profile" | ".bashrc" | ".zprofile" | ".zshrc" | ".zlogin"
-        ) {
-            return AccessMode::Read;
-        }
+        )
+    {
+        return AccessMode::Read;
     }
 
     if lower.contains("cannot create")
         || lower.contains("can't create")
         || lower.contains("write error")
         || lower.contains("read-only file system")
+        || lower.contains("operation not permitted, mkdir ")
+        || lower.contains("permission denied, mkdir ")
+        || lower.contains("eperm") && lower.contains("mkdir ")
+        || lower.contains("eacces") && lower.contains("mkdir ")
         || lower.starts_with("tee:")
         || lower.starts_with("touch:")
         || lower.starts_with("mkdir:")
@@ -495,6 +631,7 @@ pub struct DiagnosticFormatter<'a> {
     caps: &'a CapabilitySet,
     mode: DiagnosticMode,
     denials: &'a [DenialRecord],
+    ipc_denials: &'a [IpcDenialRecord],
     sandbox_violations: &'a [SandboxViolation],
     /// Paths that are write-protected due to trust verification
     protected_paths: &'a [PathBuf],
@@ -526,6 +663,7 @@ impl<'a> DiagnosticFormatter<'a> {
             caps,
             mode: DiagnosticMode::Standard,
             denials: &[],
+            ipc_denials: &[],
             sandbox_violations: &[],
             protected_paths: &[],
             primary_verdict: None,
@@ -551,6 +689,13 @@ impl<'a> DiagnosticFormatter<'a> {
     #[must_use]
     pub fn with_denials(mut self, denials: &'a [DenialRecord]) -> Self {
         self.denials = denials;
+        self
+    }
+
+    /// Add IPC denial records from a supervised session.
+    #[must_use]
+    pub fn with_ipc_denials(mut self, denials: &'a [IpcDenialRecord]) -> Self {
+        self.ipc_denials = denials;
         self
     }
 
@@ -908,11 +1053,11 @@ impl<'a> DiagnosticFormatter<'a> {
         }
         lines.push("[nono]".to_string());
 
-        if self.blocked_protected_file.is_none() {
-            if let Some(verdict) = primary_verdict.as_ref() {
-                self.format_primary_verdict_guidance(&mut lines, verdict);
-                lines.push("[nono]".to_string());
-            }
+        if self.blocked_protected_file.is_none()
+            && let Some(verdict) = primary_verdict.as_ref()
+        {
+            self.format_primary_verdict_guidance(&mut lines, verdict);
+            lines.push("[nono]".to_string());
         }
 
         // Concise policy summary: show user paths, summarize system/group paths
@@ -948,14 +1093,17 @@ impl<'a> DiagnosticFormatter<'a> {
         let primary_verdict = self.primary_observation_verdict();
         let has_observation = self.has_error_observation();
 
+        let has_ipc_denials = !self.ipc_denials.is_empty();
+
         if self.denials.is_empty()
+            && !has_ipc_denials
             && matches!(
                 primary_verdict.as_ref(),
                 Some(ErrorVerdict::MissingPath(_)) | Some(ErrorVerdict::NonSandboxFailure(_))
             )
         {
             lines.push(format_command_failed_not_sandbox_line(exit_code));
-        } else if exit_code == 0 && has_observation && self.denials.is_empty() {
+        } else if exit_code == 0 && has_observation && self.denials.is_empty() && !has_ipc_denials {
             lines.push(format_command_succeeded_with_stderr_line());
         } else {
             lines.extend(self.format_exit_explanation(exit_code));
@@ -968,14 +1116,22 @@ impl<'a> DiagnosticFormatter<'a> {
 
         // Merge supervisor denials (Linux seccomp) with violation-derived
         // denials (macOS Seatbelt) into a single unified list.
-        let all_denials: Vec<DenialRecord> = self
+        let mut all_denials: Vec<DenialRecord> = self
             .denials
             .iter()
             .cloned()
             .chain(violation_denials)
             .collect();
+        all_denials.extend(self.observed_denials_matching_logged_paths(&all_denials));
 
-        if all_denials.is_empty() {
+        if !self.ipc_denials.is_empty() {
+            self.format_ipc_denial_guidance(&mut lines);
+            if !all_denials.is_empty() || !non_fs_violations.is_empty() {
+                lines.push("[nono]".to_string());
+            }
+        }
+
+        if all_denials.is_empty() && self.ipc_denials.is_empty() {
             // No denials from either source.
             if !non_fs_violations.is_empty() {
                 // Non-filesystem violations (mach-lookup, signal, etc.) —
@@ -999,7 +1155,7 @@ impl<'a> DiagnosticFormatter<'a> {
             self.format_grant_help(&mut lines);
             lines.push("[nono]".to_string());
             self.format_follow_up_guidance(&mut lines, None);
-        } else {
+        } else if !all_denials.is_empty() {
             // Deduplicate by path, merging access modes. Classification into
             // actionable vs. policy-blocked is done by the consolidated
             // formatter using policy_explanations when available.
@@ -1031,6 +1187,30 @@ impl<'a> DiagnosticFormatter<'a> {
                         path: hint.path.clone(),
                         access,
                     })
+            })
+            .collect()
+    }
+
+    fn observed_denials_matching_logged_paths(
+        &self,
+        denials: &[DenialRecord],
+    ) -> Vec<DenialRecord> {
+        if denials.is_empty() {
+            return Vec::new();
+        }
+
+        let logged_paths = denials
+            .iter()
+            .map(|denial| denial.path.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        self.actionable_observed_path_hints()
+            .into_iter()
+            .filter(|hint| logged_paths.contains(&hint.path))
+            .map(|hint| DenialRecord {
+                path: hint.path,
+                access: hint.access,
+                reason: DenialReason::InsufficientAccess,
             })
             .collect()
     }
@@ -1204,11 +1384,40 @@ impl<'a> DiagnosticFormatter<'a> {
     ) {
         const MAX_INLINE_LIST: usize = 10;
 
-        let total = denials.len();
+        let (unix_socket_denials, path_denials): (Vec<&DenialRecord>, Vec<&DenialRecord>) = denials
+            .iter()
+            .partition(|denial| denial.reason == DenialReason::UnixSocketDenied);
+
+        if !unix_socket_denials.is_empty() {
+            let total = unix_socket_denials.len();
+            let plural_s = if total == 1 { "" } else { "s" };
+            lines.push(format!(
+                "[nono] IPC denial: {} pathname Unix socket{} blocked.",
+                total, plural_s
+            ));
+            for (idx, denial) in unix_socket_denials.iter().enumerate() {
+                if idx >= MAX_INLINE_LIST {
+                    lines.push(format!("[nono]   ... and {} more", total - idx));
+                    break;
+                }
+                lines.push(format!("[nono]   {}", denial.path.display()));
+            }
+            let flags: Vec<String> = unix_socket_denials
+                .iter()
+                .map(|d| self.suggested_flag_for_denial(d))
+                .collect();
+            lines.push(format!("[nono] Fix: {}", flags.join(" ")));
+        }
+
+        if path_denials.is_empty() {
+            return;
+        }
+
+        let total = path_denials.len();
         let mut actionable: Vec<&DenialRecord> = Vec::new();
         let mut policy_blocked: Vec<&DenialRecord> = Vec::new();
 
-        for denial in denials {
+        for denial in &path_denials {
             if self.is_denial_policy_blocked(denial) {
                 policy_blocked.push(denial);
             } else {
@@ -1222,7 +1431,7 @@ impl<'a> DiagnosticFormatter<'a> {
             total, plural_s
         ));
 
-        for (idx, denial) in denials.iter().enumerate() {
+        for (idx, denial) in path_denials.iter().enumerate() {
             if idx >= MAX_INLINE_LIST {
                 lines.push(format!("[nono]   … and {} more", total - idx));
                 break;
@@ -1268,6 +1477,36 @@ impl<'a> DiagnosticFormatter<'a> {
         }
     }
 
+    fn format_ipc_denial_guidance(&self, lines: &mut Vec<String>) {
+        const MAX_INLINE_LIST: usize = 10;
+
+        let total = self.ipc_denials.len();
+        let plural_s = if total == 1 { "" } else { "s" };
+        lines.push(format!(
+            "[nono] IPC denial: {} Unix socket operation{} blocked.",
+            total, plural_s
+        ));
+        for (idx, denial) in self.ipc_denials.iter().enumerate() {
+            if idx >= MAX_INLINE_LIST {
+                lines.push(format!("[nono]   ... and {} more", total - idx));
+                break;
+            }
+            lines.push(format!(
+                "[nono]   {} {} ({})",
+                denial.operation, denial.target, denial.reason
+            ));
+        }
+
+        let flags: Vec<&str> = self
+            .ipc_denials
+            .iter()
+            .filter_map(|denial| denial.suggested_flag.as_deref())
+            .collect();
+        if !flags.is_empty() {
+            lines.push(format!("[nono] Fix: {}", flags.join(" ")));
+        }
+    }
+
     /// Return true when the denial cannot be fixed by a path flag alone —
     /// i.e. the path is blocked by the sensitive-path policy and requires a
     /// profile with `filesystem.bypass_protection`.
@@ -1288,10 +1527,19 @@ impl<'a> DiagnosticFormatter<'a> {
     /// explanation's `suggested_flag` (which knows about parent-directory
     /// canonicalization) and falls back to a local computation otherwise.
     fn suggested_flag_for_denial(&self, denial: &DenialRecord) -> String {
+        if denial.reason == DenialReason::UnixSocketDenied {
+            let flag = if denial.access.contains(AccessMode::Write) {
+                "--allow-unix-socket-bind"
+            } else {
+                "--allow-unix-socket"
+            };
+            return format!("{} {}", flag, denial.path.display());
+        }
+
         if let Some(flag) = self
             .policy_explanations
             .iter()
-            .find(|e| e.path == denial.path)
+            .find(|e| e.path == denial.path && e.access == denial.access)
             .and_then(|e| e.suggested_flag.clone())
         {
             // explanations' suggested_flag is of the form "--read /path".
@@ -1509,29 +1757,213 @@ impl<'a> DiagnosticFormatter<'a> {
     }
 }
 
-/// Human-readable descriptions for commonly denied macOS mach services.
-fn describe_mach_service(service: &str) -> Option<&'static str> {
-    Some(match service {
-        s if s.starts_with("com.apple.security") || s == "com.apple.secd" => {
-            "Keychain / Security framework"
+/// Catalog of observed non-filesystem macOS sandbox denials.
+///
+/// Apple's public documentation covers APIs such as CFPreferences, but not a
+/// complete stable taxonomy of Seatbelt operation names. Keep this table
+/// evidence-based: add entries only when they are observed in sandbox logs or
+/// backed by a known framework/daemon mapping.
+#[derive(Debug, Clone, Copy)]
+struct SystemServiceDiagnostic {
+    operation: &'static str,
+    target: SystemServiceTarget,
+    description: &'static str,
+    guidance: Option<SystemServiceGuidance>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SystemServiceTarget {
+    Any,
+    Exact(&'static str),
+    Prefix(&'static str),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SystemServiceGuidance {
+    Keychain,
+    SetuidExec,
+    UserPreferences,
+}
+
+const SYSTEM_SERVICE_DIAGNOSTICS: &[SystemServiceDiagnostic] = &[
+    SystemServiceDiagnostic::exact(
+        "mach-lookup",
+        "com.apple.SecurityServer",
+        "Keychain / Security framework",
+        Some(SystemServiceGuidance::Keychain),
+    ),
+    SystemServiceDiagnostic::exact(
+        "mach-lookup",
+        "com.apple.securityd",
+        "Keychain / Security framework",
+        Some(SystemServiceGuidance::Keychain),
+    ),
+    SystemServiceDiagnostic::exact(
+        "mach-lookup",
+        "com.apple.security.keychaind",
+        "Keychain / Security framework",
+        Some(SystemServiceGuidance::Keychain),
+    ),
+    SystemServiceDiagnostic::exact(
+        "mach-lookup",
+        "com.apple.secd",
+        "Keychain / Security framework",
+        Some(SystemServiceGuidance::Keychain),
+    ),
+    SystemServiceDiagnostic::exact(
+        "mach-lookup",
+        "com.apple.security.agent",
+        "Keychain authorization agent",
+        Some(SystemServiceGuidance::Keychain),
+    ),
+    SystemServiceDiagnostic::exact("mach-lookup", "com.apple.logd", "System logging", None),
+    SystemServiceDiagnostic::exact(
+        "mach-lookup",
+        "com.apple.system.notification_center",
+        "Distributed notifications",
+        None,
+    ),
+    SystemServiceDiagnostic::exact(
+        "mach-lookup",
+        "com.apple.distributed_notifications",
+        "Distributed notifications",
+        None,
+    ),
+    SystemServiceDiagnostic::exact(
+        "mach-lookup",
+        "com.apple.CoreServices.coreservicesd",
+        "Launch Services",
+        None,
+    ),
+    SystemServiceDiagnostic::exact(
+        "mach-lookup",
+        "com.apple.lsd.mapdb",
+        "Launch Services",
+        None,
+    ),
+    SystemServiceDiagnostic::prefix(
+        "mach-lookup",
+        "com.apple.windowserver",
+        "Window Server / GUI",
+        None,
+    ),
+    SystemServiceDiagnostic::prefix(
+        "mach-lookup",
+        "com.apple.cfprefsd",
+        "Preferences (CFPreferences / NSUserDefaults)",
+        None,
+    ),
+    SystemServiceDiagnostic::prefix(
+        "mach-lookup",
+        "com.apple.pasteboard",
+        "Pasteboard / clipboard",
+        None,
+    ),
+    SystemServiceDiagnostic::prefix(
+        "mach-lookup",
+        "com.apple.coreservices",
+        "Core Services",
+        None,
+    ),
+    SystemServiceDiagnostic::exact(
+        "user-preference-read",
+        "kcfpreferencesanyapplication",
+        "Global preferences (CFPreferences any-application domain)",
+        Some(SystemServiceGuidance::UserPreferences),
+    ),
+    SystemServiceDiagnostic::prefix(
+        "user-preference-read",
+        "kcfpreferences",
+        "Preferences (CFPreferences / NSUserDefaults)",
+        Some(SystemServiceGuidance::UserPreferences),
+    ),
+    SystemServiceDiagnostic::any(
+        "forbidden-exec-sugid",
+        "Setuid/setgid executable blocked",
+        Some(SystemServiceGuidance::SetuidExec),
+    ),
+];
+
+impl SystemServiceDiagnostic {
+    const fn any(
+        operation: &'static str,
+        description: &'static str,
+        guidance: Option<SystemServiceGuidance>,
+    ) -> Self {
+        Self {
+            operation,
+            target: SystemServiceTarget::Any,
+            description,
+            guidance,
         }
-        "com.apple.logd" => "System logging",
-        "com.apple.system.notification_center" | "com.apple.distributed_notifications" => {
-            "Distributed notifications"
+    }
+
+    const fn exact(
+        operation: &'static str,
+        target: &'static str,
+        description: &'static str,
+        guidance: Option<SystemServiceGuidance>,
+    ) -> Self {
+        Self {
+            operation,
+            target: SystemServiceTarget::Exact(target),
+            description,
+            guidance,
         }
-        "com.apple.CoreServices.coreservicesd" | "com.apple.lsd.mapdb" => "Launch Services",
-        s if s.starts_with("com.apple.windowserver") => "Window Server / GUI",
-        s if s.starts_with("com.apple.cfprefsd") => "Preferences (NSUserDefaults)",
-        s if s.starts_with("com.apple.pasteboard") => "Pasteboard / clipboard",
-        s if s.starts_with("com.apple.coreservices") => "Core Services",
-        _ => return None,
-    })
+    }
+
+    const fn prefix(
+        operation: &'static str,
+        target_prefix: &'static str,
+        description: &'static str,
+        guidance: Option<SystemServiceGuidance>,
+    ) -> Self {
+        Self {
+            operation,
+            target: SystemServiceTarget::Prefix(target_prefix),
+            description,
+            guidance,
+        }
+    }
+
+    fn matches(&self, violation: &SandboxViolation) -> bool {
+        if violation.operation != self.operation {
+            return false;
+        }
+        match self.target {
+            SystemServiceTarget::Any => true,
+            _ => violation
+                .target
+                .as_deref()
+                .is_some_and(|target| self.target.matches(target)),
+        }
+    }
+}
+
+impl SystemServiceTarget {
+    fn matches(self, target: &str) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Exact(expected) => target.eq_ignore_ascii_case(expected),
+            Self::Prefix(prefix) => target
+                .get(..prefix.len())
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix)),
+        }
+    }
+}
+
+fn system_service_diagnostic_for(
+    violation: &SandboxViolation,
+) -> Option<&'static SystemServiceDiagnostic> {
+    SYSTEM_SERVICE_DIAGNOSTICS
+        .iter()
+        .find(|diagnostic| diagnostic.matches(violation))
 }
 
 /// Format non-filesystem violations with human-readable service descriptions.
 fn format_non_fs_violations(lines: &mut Vec<String>, violations: &[&SandboxViolation]) {
     for v in violations {
-        let desc = v.target.as_deref().and_then(describe_mach_service);
+        let desc = system_service_diagnostic_for(v).map(|diagnostic| diagnostic.description);
         match (&v.target, desc) {
             (Some(target), Some(description)) => {
                 lines.push(format!(
@@ -1542,7 +1974,10 @@ fn format_non_fs_violations(lines: &mut Vec<String>, violations: &[&SandboxViola
             (Some(target), None) => {
                 lines.push(format!("[nono]   {} ({})", v.operation, target));
             }
-            (None, _) => {
+            (None, Some(description)) => {
+                lines.push(format!("[nono]   {} — {}", v.operation, description));
+            }
+            (None, None) => {
                 lines.push(format!("[nono]   {}", v.operation));
             }
         }
@@ -1551,16 +1986,60 @@ fn format_non_fs_violations(lines: &mut Vec<String>, violations: &[&SandboxViola
 
 /// Generate actionable guidance for non-filesystem violations.
 fn format_non_fs_guidance(lines: &mut Vec<String>, violations: &[&SandboxViolation]) {
-    let has_keychain = violations.iter().any(|v| {
-        v.target
-            .as_deref()
-            .is_some_and(|t| t.contains("SecurityServer") || t.contains("securityd"))
-    });
+    let has_guidance = |guidance| {
+        violations.iter().any(|violation| {
+            system_service_diagnostic_for(violation).and_then(|diagnostic| diagnostic.guidance)
+                == Some(guidance)
+        })
+    };
 
-    if has_keychain {
+    if has_guidance(SystemServiceGuidance::Keychain) {
         lines.push("[nono] Keychain access requires granting the login keychain path:".to_string());
-        lines.push("[nono]   --read ~/Library/Keychains/login.keychain-db".to_string());
+        lines.push(keychain_login_grant_guidance());
     }
+
+    if has_guidance(SystemServiceGuidance::UserPreferences) {
+        lines.push("[nono] Preference reads use macOS CFPreferences / NSUserDefaults.".to_string());
+        lines.push(
+            "[nono] They are platform operations, not filesystem paths; saving them writes a raw macOS Seatbelt rule.".to_string(),
+        );
+        lines.push(
+            "[nono] If the tool requires this, accept the profile prompt or add a reviewed user profile rule:".to_string(),
+        );
+        lines.push(
+            "[nono]   \"unsafe_macos_seatbelt_rules\": [\"(allow user-preference-read)\"]"
+                .to_string(),
+        );
+    }
+
+    if has_guidance(SystemServiceGuidance::SetuidExec) {
+        lines.push(
+            "[nono] A sandboxed process tried to execute a setuid/setgid binary.".to_string(),
+        );
+        lines.push(
+            "[nono] macOS blocks privilege-changing execs inside this sandbox; this is not a path grant.".to_string(),
+        );
+        lines.push(
+            "[nono] nono does not save this automatically. Prefer a non-setuid helper, or run the privileged helper outside nono after review.".to_string(),
+        );
+    }
+}
+
+fn keychain_login_grant_guidance() -> String {
+    const DISPLAY_PATH: &str = "~/Library/Keychains/login.keychain-db";
+    let Some(home) = std::env::var_os("HOME") else {
+        return format!("[nono]   --read-file {DISPLAY_PATH}");
+    };
+    let path = PathBuf::from(home).join("Library/Keychains/login.keychain-db");
+    keychain_grant_guidance_for_path(&path, DISPLAY_PATH)
+}
+
+fn keychain_grant_guidance_for_path(path: &Path, display_path: &str) -> String {
+    let flag = match std::fs::metadata(path).map(|metadata| metadata.file_type()) {
+        Ok(file_type) if file_type.is_dir() => "--read",
+        _ => "--read-file",
+    };
+    format!("[nono]   {flag} {display_path}")
 }
 
 /// Deduplicate denials by path, merging access modes. When the same path
@@ -1594,17 +2073,14 @@ fn stricter_reason(a: DenialReason, b: DenialReason) -> DenialReason {
     fn rank(r: &DenialReason) -> u8 {
         match r {
             DenialReason::PolicyBlocked => 5,
+            DenialReason::UnixSocketDenied => 5,
             DenialReason::InsufficientAccess => 4,
             DenialReason::UserDenied => 3,
             DenialReason::RateLimited => 2,
             DenialReason::BackendError => 1,
         }
     }
-    if rank(&a) >= rank(&b) {
-        a
-    } else {
-        b
-    }
+    if rank(&a) >= rank(&b) { a } else { b }
 }
 
 /// Map a Seatbelt operation name to an `AccessMode`.
@@ -1965,6 +2441,59 @@ mod tests {
             observation.path_hints,
             vec![ObservedPathHint {
                 path: PathBuf::from("/tmp/file with spaces.txt"),
+                access: AccessMode::Write,
+            }]
+        );
+    }
+
+    #[test]
+    fn test_analyze_error_output_detects_node_eperm_mkdir_as_write() {
+        let observation = analyze_error_output(
+            "Failed to extract bundled package: Error: EPERM: operation not permitted, mkdir '/Users/luke/Library/Caches/copilot/pkg/darwin-arm64'\n",
+            &[],
+            None,
+        );
+
+        let hint = ObservedPathHint {
+            path: PathBuf::from("/Users/luke/Library/Caches/copilot/pkg/darwin-arm64"),
+            access: AccessMode::Write,
+        };
+        assert_eq!(observation.path_hints, vec![hint.clone()]);
+        assert_eq!(
+            observation.primary_verdict,
+            Some(ErrorVerdict::LikelySandbox(hint))
+        );
+    }
+
+    #[test]
+    fn test_analyze_error_output_detects_structured_node_eperm_mkdir_path() {
+        let observation = analyze_error_output(
+            "Error: EPERM: operation not permitted\n  code: 'EPERM',\n  syscall: 'mkdir',\n  path: '/Users/luke/Library/Caches/copilot/pkg/darwin-arm64'\n",
+            &[],
+            None,
+        );
+
+        assert_eq!(
+            observation.path_hints,
+            vec![ObservedPathHint {
+                path: PathBuf::from("/Users/luke/Library/Caches/copilot/pkg/darwin-arm64"),
+                access: AccessMode::Write,
+            }]
+        );
+    }
+
+    #[test]
+    fn test_analyze_error_output_detects_structured_path_with_escaped_quote() {
+        let observation = analyze_error_output(
+            "Error: EPERM: operation not permitted\n  code: 'EPERM',\n  syscall: 'mkdir',\n  path: '/Users/luke/Library/Caches/it\\'s/pkg'\n",
+            &[],
+            None,
+        );
+
+        assert_eq!(
+            observation.path_hints,
+            vec![ObservedPathHint {
+                path: PathBuf::from("/Users/luke/Library/Caches/it's/pkg"),
                 access: AccessMode::Write,
             }]
         );
@@ -2470,7 +2999,9 @@ mod tests {
         );
         assert!(output.contains(&missing.display().to_string()));
         assert!(output.contains("To grant additional access, re-run with:"));
-        assert!(output.contains("Query policy: nono why --path <path> --op <read|write|readwrite>"));
+        assert!(
+            output.contains("Query policy: nono why --path <path> --op <read|write|readwrite>")
+        );
     }
 
     #[test]
@@ -2540,6 +3071,131 @@ mod tests {
     }
 
     #[test]
+    fn test_supervised_merges_mkdir_error_hint_with_logged_read_denial() {
+        let temp = tempdir().expect("tempdir should be created");
+        let pkg = temp.path().join("Library/Caches/copilot/pkg");
+        std::fs::create_dir_all(&pkg).expect("pkg fixture should be created");
+        let denied = pkg.join("darwin-arm64");
+
+        let caps = CapabilitySet::new();
+        let violations = vec![SandboxViolation {
+            operation: "file-read-data".to_string(),
+            target: Some(denied.display().to_string()),
+        }];
+        let formatter = DiagnosticFormatter::new(&caps)
+            .with_mode(DiagnosticMode::Supervised)
+            .with_sandbox_violations(&violations)
+            .with_error_observation(ErrorObservation {
+                primary_verdict: Some(ErrorVerdict::LikelySandbox(ObservedPathHint {
+                    path: denied.clone(),
+                    access: AccessMode::Write,
+                })),
+                blocked_protected_file: None,
+                path_hints: vec![ObservedPathHint {
+                    path: denied.clone(),
+                    access: AccessMode::Write,
+                }],
+                missing_paths: Vec::new(),
+                non_sandbox_failure: None,
+            })
+            .with_policy_explanations(vec![PolicyExplanation {
+                path: denied.clone(),
+                access: AccessMode::Read,
+                reason: "path_not_granted".to_string(),
+                details: None,
+                policy_source: None,
+                suggested_flag: Some(format!("--read {}", denied.display())),
+            }]);
+        let output = formatter.format_footer(1);
+
+        assert!(output.contains(&format!("{} (read+write)", denied.display())));
+        assert!(output.contains(&format!("Fix: --allow {}", pkg.display())));
+        assert!(!output.contains(&format!("Fix: --read {}", denied.display())));
+    }
+
+    #[test]
+    fn test_keychain_guidance_uses_file_flag_for_file_targets() {
+        let dir = tempdir().expect("tempdir should be created");
+        let keychain = dir.path().join("login.keychain-db");
+        std::fs::write(&keychain, "db").expect("keychain fixture should be written");
+
+        let guidance =
+            keychain_grant_guidance_for_path(&keychain, "~/Library/Keychains/login.keychain-db");
+
+        assert_eq!(
+            guidance,
+            "[nono]   --read-file ~/Library/Keychains/login.keychain-db"
+        );
+    }
+
+    #[test]
+    fn test_keychain_guidance_uses_directory_flag_for_directory_targets() {
+        let dir = tempdir().expect("tempdir should be created");
+
+        let guidance =
+            keychain_grant_guidance_for_path(dir.path(), "~/Library/Keychains/login.keychain-db");
+
+        assert_eq!(
+            guidance,
+            "[nono]   --read ~/Library/Keychains/login.keychain-db"
+        );
+    }
+
+    #[test]
+    fn test_keychain_guidance_recognizes_keychain_mach_services() {
+        let caps = make_test_caps();
+        let violations = vec![SandboxViolation {
+            operation: "mach-lookup".to_string(),
+            target: Some("com.apple.secd".to_string()),
+        }];
+        let formatter = DiagnosticFormatter::new(&caps)
+            .with_mode(DiagnosticMode::Supervised)
+            .with_sandbox_violations(&violations);
+        let output = formatter.format_footer(1);
+
+        assert!(output.contains("Keychain access requires granting the login keychain path:"));
+        assert!(output.contains("--read-file ~/Library/Keychains/login.keychain-db"));
+    }
+
+    #[test]
+    fn test_preference_guidance_recognizes_any_application_domain() {
+        let caps = make_test_caps();
+        let violations = vec![SandboxViolation {
+            operation: "user-preference-read".to_string(),
+            target: Some("kcfpreferencesanyapplication".to_string()),
+        }];
+        let formatter = DiagnosticFormatter::new(&caps)
+            .with_mode(DiagnosticMode::Supervised)
+            .with_sandbox_violations(&violations);
+        let output = formatter.format_footer(1);
+
+        assert!(output.contains("user-preference-read (kcfpreferencesanyapplication)"));
+        assert!(output.contains("Global preferences"));
+        assert!(output.contains("CFPreferences / NSUserDefaults"));
+        assert!(output.contains("unsafe_macos_seatbelt_rules"));
+        assert!(output.contains("(allow user-preference-read)"));
+    }
+
+    #[test]
+    fn test_forbidden_exec_sugid_guidance_is_not_saveable() {
+        let caps = make_test_caps();
+        let violations = vec![SandboxViolation {
+            operation: "forbidden-exec-sugid".to_string(),
+            target: None,
+        }];
+        let formatter = DiagnosticFormatter::new(&caps)
+            .with_mode(DiagnosticMode::Supervised)
+            .with_sandbox_violations(&violations);
+        let output = formatter.format_footer(0);
+
+        assert!(output.contains("forbidden-exec-sugid"));
+        assert!(output.contains("Setuid/setgid executable blocked"));
+        assert!(output.contains("not a path grant"));
+        assert!(output.contains("does not save this automatically"));
+        assert!(!output.contains("unsafe_macos_seatbelt_rules"));
+    }
+
+    #[test]
     fn test_supervised_policy_blocked_denial() {
         let caps = make_test_caps();
         let denials = vec![DenialRecord {
@@ -2558,6 +3214,26 @@ mod tests {
         // Policy-blocked paths cannot be fixed with a path flag.
         assert!(!output.contains("Fix: --read /etc/shadow"));
         assert!(!output.contains("--allow <path>"));
+    }
+
+    #[test]
+    fn test_supervised_unix_socket_denial_uses_ipc_guidance() {
+        let caps = make_test_caps();
+        let denials = vec![DenialRecord {
+            path: PathBuf::from("/run/user/1000/bus"),
+            access: AccessMode::Read,
+            reason: DenialReason::UnixSocketDenied,
+        }];
+        let formatter = DiagnosticFormatter::new(&caps)
+            .with_mode(DiagnosticMode::Supervised)
+            .with_denials(&denials);
+        let output = formatter.format_footer(1);
+
+        assert!(output.contains("IPC denial: 1 pathname Unix socket blocked."));
+        assert!(output.contains("/run/user/1000/bus"));
+        assert!(output.contains("Fix: --allow-unix-socket /run/user/1000/bus"));
+        assert!(!output.contains("No path denials were observed"));
+        assert!(!output.contains("--read /run/user/1000/bus"));
     }
 
     #[test]

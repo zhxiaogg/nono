@@ -9,8 +9,8 @@ use crate::output;
 use crate::profile;
 use crate::profile::WorkdirAccess;
 use crate::profile_runtime::{prepare_profile, prepare_profile_for_preflight};
-use crate::{policy, protected_paths, sandbox_state};
 use crate::{DETACHED_CWD_PROMPT_RESPONSE_ENV, DETACHED_LAUNCH_ENV};
+use crate::{policy, protected_paths, sandbox_state};
 use colored::Colorize;
 use nono::{AccessMode, CapabilitySet, FsCapability, NonoError, Result, Sandbox};
 #[cfg(target_os = "macos")]
@@ -235,10 +235,10 @@ fn load_claude_oauth_state_from_raw_sources(
     keychain_raw: Option<&str>,
     file_raw: Option<(&str, &str)>,
 ) -> std::result::Result<Option<ClaudeOauthState>, String> {
-    if let Some(raw) = keychain_raw {
-        if let Some(oauth) = parse_claude_oauth_state_json(raw, "Claude OAuth keychain JSON")? {
-            return Ok(Some(oauth));
-        }
+    if let Some(raw) = keychain_raw
+        && let Some(oauth) = parse_claude_oauth_state_json(raw, "Claude OAuth keychain JSON")?
+    {
+        return Ok(Some(oauth));
     }
 
     if let Some((raw, source_label)) = file_raw {
@@ -429,12 +429,16 @@ pub(crate) struct PreparedSandbox {
     pub(crate) capability_elevation: bool,
     #[cfg(target_os = "linux")]
     pub(crate) wsl2_proxy_policy: crate::profile::Wsl2ProxyPolicy,
+    #[cfg(target_os = "linux")]
+    pub(crate) af_unix_mediation: crate::profile::LinuxAfUnixMediation,
     pub(crate) allow_launch_services_active: bool,
     pub(crate) allow_gpu_active: bool,
     pub(crate) open_url_origins: Vec<String>,
     pub(crate) open_url_allow_localhost: bool,
     pub(crate) bypass_protection_paths: Vec<PathBuf>,
+    pub(crate) ignored_denial_paths: Vec<PathBuf>,
     pub(crate) allowed_env_vars: Option<Vec<String>>,
+    pub(crate) denied_env_vars: Option<Vec<String>>,
 }
 
 fn resolved_workdir(args: &SandboxArgs) -> PathBuf {
@@ -564,8 +568,14 @@ fn finalize_prepared_sandbox(
     output::print_skipped_requested_paths(&collect_missing_cli_requested_paths(args), silent);
     output::print_capabilities(&prepared.caps, args.verbose, silent);
 
+    if let Some(ref profile_name) = args.profile {
+        crate::pack_update_hint::show_pack_update_hints(profile_name, silent);
+    }
+
     #[cfg(target_os = "linux")]
     output::print_abi_info(silent);
+    #[cfg(target_os = "linux")]
+    output::print_landlock_scope_policy(&prepared.caps, args.verbose, silent);
 
     if !Sandbox::is_supported() {
         return Err(NonoError::SandboxInit(Sandbox::support_info().details));
@@ -1037,12 +1047,16 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 capability_elevation: false,
                 #[cfg(target_os = "linux")]
                 wsl2_proxy_policy: crate::profile::Wsl2ProxyPolicy::default(),
+                #[cfg(target_os = "linux")]
+                af_unix_mediation: crate::profile::LinuxAfUnixMediation::default(),
                 allow_launch_services_active: false,
                 allow_gpu_active: false,
                 open_url_origins: Vec::new(),
                 open_url_allow_localhost: false,
                 bypass_protection_paths: Vec::new(),
+                ignored_denial_paths: Vec::new(),
                 allowed_env_vars: None,
+                denied_env_vars: None,
             },
             args,
             silent,
@@ -1055,6 +1069,8 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         capability_elevation,
         #[cfg(target_os = "linux")]
         wsl2_proxy_policy,
+        #[cfg(target_os = "linux")]
+        af_unix_mediation,
         workdir_access: profile_workdir_access,
         rollback_exclude_patterns: profile_rollback_patterns,
         rollback_exclude_globs: profile_rollback_globs,
@@ -1071,7 +1087,9 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         allow_gpu: profile_allow_gpu,
         allow_parent_of_protected: profile_allow_parent_of_protected,
         bypass_protection_paths,
+        ignored_denial_paths,
         allowed_env_vars: profile_allowed_env_vars,
+        denied_env_vars: profile_denied_env_vars,
     } = prepared_profile;
 
     if let Some(profile) = loaded_profile.as_ref() {
@@ -1097,10 +1115,10 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                     .open(path)
                     .map(|_| ())
             };
-            if let Err(e) = result {
-                if e.kind() != std::io::ErrorKind::AlreadyExists {
-                    warn!("Failed to pre-create {}: {}", path.display(), e);
-                }
+            if let Err(e) = result
+                && e.kind() != std::io::ErrorKind::AlreadyExists
+            {
+                warn!("Failed to pre-create {}: {}", path.display(), e);
             }
         };
 
@@ -1139,10 +1157,10 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 // File doesn't exist yet — pre-create the target so the
                 // sandbox can attach a path rule to it, then symlink.
                 precreate(&redirect_target, false);
-                if let Err(e) = std::os::unix::fs::symlink(".claude/claude.json", &claude_json) {
-                    if e.kind() != std::io::ErrorKind::AlreadyExists {
-                        warn!("Failed to create ~/.claude.json symlink: {}", e);
-                    }
+                if let Err(e) = std::os::unix::fs::symlink(".claude/claude.json", &claude_json)
+                    && e.kind() != std::io::ErrorKind::AlreadyExists
+                {
+                    warn!("Failed to create ~/.claude.json symlink: {}", e);
                 }
             }
         }
@@ -1162,19 +1180,19 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
 
     // Apply raw Seatbelt rules from the profile (macOS only).
     #[cfg(target_os = "macos")]
-    if let Some(ref profile) = loaded_profile {
-        if !profile.unsafe_macos_seatbelt_rules.is_empty() {
-            info!(
-                "Profile uses {} raw Seatbelt rule(s) via unsafe_macos_seatbelt_rules — review carefully",
-                profile.unsafe_macos_seatbelt_rules.len()
-            );
-            for rule in &profile.unsafe_macos_seatbelt_rules {
-                caps.add_platform_rule(rule).map_err(|e| {
-                    NonoError::ConfigParse(format!(
-                        "unsafe_macos_seatbelt_rules: invalid rule {rule:?}: {e}"
-                    ))
-                })?;
-            }
+    if let Some(ref profile) = loaded_profile
+        && !profile.unsafe_macos_seatbelt_rules.is_empty()
+    {
+        info!(
+            "Profile uses {} raw Seatbelt rule(s) via unsafe_macos_seatbelt_rules — review carefully",
+            profile.unsafe_macos_seatbelt_rules.len()
+        );
+        for rule in &profile.unsafe_macos_seatbelt_rules {
+            caps.add_platform_rule(rule).map_err(|e| {
+                NonoError::ConfigParse(format!(
+                    "unsafe_macos_seatbelt_rules: invalid rule {rule:?}: {e}"
+                ))
+            })?;
         }
     }
 
@@ -1244,20 +1262,14 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
     if let Some(ref profile) = loaded_profile {
         for pack_ref in &profile.packs {
             let parts: Vec<&str> = pack_ref.splitn(2, '/').collect();
-            if parts.len() == 2 {
-                if let Ok(pack_dir) = crate::package::package_install_dir(parts[0], parts[1]) {
-                    if pack_dir.exists() {
-                        if let Ok(canonical) = pack_dir.canonicalize() {
-                            if !caps.path_covered_with_access(&canonical, nono::AccessMode::Read) {
-                                if let Ok(cap) =
-                                    FsCapability::new_dir(canonical, nono::AccessMode::Read)
-                                {
-                                    caps.add_fs(cap);
-                                }
-                            }
-                        }
-                    }
-                }
+            if parts.len() == 2
+                && let Ok(pack_dir) = crate::package::package_install_dir(parts[0], parts[1])
+                && pack_dir.exists()
+                && let Ok(canonical) = pack_dir.canonicalize()
+                && !caps.path_covered_with_access(&canonical, nono::AccessMode::Read)
+                && let Ok(cap) = FsCapability::new_dir(canonical, nono::AccessMode::Read)
+            {
+                caps.add_fs(cap);
             }
         }
         caps.deduplicate();
@@ -1327,12 +1339,16 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             capability_elevation,
             #[cfg(target_os = "linux")]
             wsl2_proxy_policy,
+            #[cfg(target_os = "linux")]
+            af_unix_mediation,
             allow_launch_services_active,
             allow_gpu_active,
             open_url_origins,
             open_url_allow_localhost,
             bypass_protection_paths,
+            ignored_denial_paths,
             allowed_env_vars: profile_allowed_env_vars,
+            denied_env_vars: profile_denied_env_vars,
         },
         args,
         silent,
@@ -1752,9 +1768,11 @@ mod tests {
             FsCapability::new_dir(dir.path(), AccessMode::ReadWrite).expect("dir capability"),
         );
 
-        assert!(pending_cwd_access_request(&caps, dir.path(), None)
-            .expect("request should evaluate")
-            .is_none());
+        assert!(
+            pending_cwd_access_request(&caps, dir.path(), None)
+                .expect("request should evaluate")
+                .is_none()
+        );
     }
 
     #[test]

@@ -128,7 +128,7 @@ impl SetupRunner {
 
             if pid == 0 {
                 // Child process: try to apply sandbox
-                extern "C" {
+                unsafe extern "C" {
                     fn sandbox_init(
                         profile: *const std::os::raw::c_char,
                         flags: u64,
@@ -193,6 +193,20 @@ impl SetupRunner {
         for feature in detected.feature_names() {
             println!("      - {}", feature);
         }
+        if detected.has_scoping() {
+            println!("  * Landlock scoping policy:");
+            println!("    - Signal scoping: enforced for same-sandbox signal isolation modes");
+            println!(
+                "    - Abstract UNIX socket scoping: enforced for shared-memory-only IPC mode"
+            );
+        }
+
+        println!("  * Linux AF_UNIX mediation: off by default");
+        println!("    - For stricter IPC isolation, set linux.af_unix_mediation = \"pathname\"");
+        println!("    - Then grant required pathname sockets with filesystem.unix_socket entries");
+        println!(
+            "    - In public-facing or privacy-sensitive deployments that keep it off, run nono inside a stronger outer boundary such as a MicroVM"
+        );
 
         println!("  * Filesystem ruleset creation verified");
 
@@ -207,7 +221,9 @@ impl SetupRunner {
             if detected.has_network() {
                 println!("    - Per-port network filtering: available (Landlock V4+)");
             } else {
-                println!("    - Per-port network filtering: unavailable (needs kernel 6.7+ for Landlock V4)");
+                println!(
+                    "    - Per-port network filtering: unavailable (needs kernel 6.7+ for Landlock V4)"
+                );
             }
             println!(
                 "    - Credential proxy (--credential): requires wsl2_proxy_policy profile opt-in"
@@ -561,9 +577,11 @@ mod tests {
     fn test_detected_abi_has_network_for_v4_plus() {
         let detected = nono::DetectedAbi::new(landlock::ABI::V4);
         assert!(detected.has_network());
-        assert!(detected
-            .feature_names()
-            .iter()
-            .any(|n| n.starts_with("TCP network filtering")));
+        assert!(
+            detected
+                .feature_names()
+                .iter()
+                .any(|n| n.starts_with("TCP network filtering"))
+        );
     }
 }

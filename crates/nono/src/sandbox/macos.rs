@@ -18,7 +18,7 @@ use tracing::{debug, info};
 // These are private APIs but have been stable for years
 // Reference: https://reverse.put.as/wp-content/uploads/2011/09/Apple-Sandbox-Guide-v1.0.pdf
 
-extern "C" {
+unsafe extern "C" {
     fn sandbox_init(profile: *const c_char, flags: u64, errorbuf: *mut *mut c_char) -> i32;
     fn sandbox_free_error(errorbuf: *mut c_char);
 }
@@ -27,7 +27,7 @@ extern "C" {
 // These are documented in <sandbox.h> and stable across macOS versions.
 // Extensions allow an unsandboxed supervisor to issue tokens that expand
 // a sandboxed process's access for specific paths.
-extern "C" {
+unsafe extern "C" {
     fn sandbox_extension_issue_file(
         extension_class: *const c_char,
         path: *const c_char,
@@ -237,11 +237,11 @@ fn path_filters_for_cap(cap: &crate::capability::FsCapability) -> Result<Vec<Str
 
     // If the original path differs (e.g. /tmp vs /private/tmp), emit a rule
     // for the original too so Seatbelt allows traversing the symlink.
-    if cap.original != cap.resolved {
-        if let Some(original_str) = cap.original.to_str() {
-            let escaped_original = escape_path(original_str)?;
-            filters.push(format!("{} \"{}\"", kind, escaped_original));
-        }
+    if cap.original != cap.resolved
+        && let Some(original_str) = cap.original.to_str()
+    {
+        let escaped_original = escape_path(original_str)?;
+        filters.push(format!("{} \"{}\"", kind, escaped_original));
     }
 
     Ok(filters)
@@ -269,10 +269,10 @@ fn has_explicit_keychain_db_access(caps: &CapabilitySet) -> bool {
         {
             return true;
         }
-        if let Some(ref user_keychain_dbs) = user_keychain_dbs {
-            if user_keychain_dbs.iter().any(|candidate| path == candidate) {
-                return true;
-            }
+        if let Some(ref user_keychain_dbs) = user_keychain_dbs
+            && user_keychain_dbs.iter().any(|candidate| path == candidate)
+        {
+            return true;
         }
         false
     };
@@ -420,24 +420,37 @@ fn emit_unix_socket_rules(profile: &mut String, caps: &CapabilitySet) -> Result<
             &["network-outbound"]
         };
 
-        if cap.is_directory {
-            let escaped = regex_escape_path_for_seatbelt(resolved_str)?;
-            let escaped_orig = original_str
-                .map(regex_escape_path_for_seatbelt)
-                .transpose()?;
-            for op in operations {
-                profile.push_str(&format!("(allow {} (regex \"^{}/[^/]+$\"))\n", op, escaped));
-                if let Some(ref e) = escaped_orig {
-                    profile.push_str(&format!("(allow {} (regex \"^{}/[^/]+$\"))\n", op, e));
+        match cap.scope {
+            crate::SocketScope::File => {
+                let escaped = escape_path(resolved_str)?;
+                let escaped_orig = original_str.map(escape_path).transpose()?;
+                for op in operations {
+                    profile.push_str(&format!("(allow {} (path \"{}\"))\n", op, escaped));
+                    if let Some(ref e) = escaped_orig {
+                        profile.push_str(&format!("(allow {} (path \"{}\"))\n", op, e));
+                    }
                 }
             }
-        } else {
-            let escaped = escape_path(resolved_str)?;
-            let escaped_orig = original_str.map(escape_path).transpose()?;
-            for op in operations {
-                profile.push_str(&format!("(allow {} (path \"{}\"))\n", op, escaped));
-                if let Some(ref e) = escaped_orig {
-                    profile.push_str(&format!("(allow {} (path \"{}\"))\n", op, e));
+            crate::SocketScope::DirChildren => {
+                let escaped = regex_escape_path_for_seatbelt(resolved_str)?;
+                let escaped_orig = original_str
+                    .map(regex_escape_path_for_seatbelt)
+                    .transpose()?;
+                for op in operations {
+                    profile.push_str(&format!("(allow {} (regex \"^{}/[^/]+$\"))\n", op, escaped));
+                    if let Some(ref e) = escaped_orig {
+                        profile.push_str(&format!("(allow {} (regex \"^{}/[^/]+$\"))\n", op, e));
+                    }
+                }
+            }
+            crate::SocketScope::DirSubtree => {
+                let escaped = escape_path(resolved_str)?;
+                let escaped_orig = original_str.map(escape_path).transpose()?;
+                for op in operations {
+                    profile.push_str(&format!("(allow {} (subpath \"{}\"))\n", op, escaped));
+                    if let Some(ref e) = escaped_orig {
+                        profile.push_str(&format!("(allow {} (subpath \"{}\"))\n", op, e));
+                    }
                 }
             }
         }
@@ -822,6 +835,96 @@ mod tests {
         assert!(profile.contains("(allow network-outbound)"));
     }
 
+    /// Repro for tls-intercept-qa T2 failure: `head <SSL_CERT_FILE>` returned
+    /// EPERM inside the sandbox even though the proxy granted a read cap on
+    /// the file. Verifies the literal `(allow file-read* (literal "..."))`
+    /// rule is actually emitted for a path under `~/.nono/sessions/`.
+    #[test]
+    fn repro_intercept_ca_read_rule_is_emitted() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("intercept-ca.pem");
+        std::fs::write(&file_path, b"fake").unwrap();
+
+        let mut caps = CapabilitySet::new();
+        caps.allow_file_mut(&file_path, AccessMode::Read).unwrap();
+
+        let profile = generate_profile(&caps).unwrap();
+        let canonical = file_path.canonicalize().unwrap();
+        let canonical_str = canonical.to_str().unwrap();
+        let expected = format!("(allow file-read* (literal \"{}\"))", canonical_str);
+
+        assert!(
+            profile.contains(&expected),
+            "expected profile to contain `{}`\n\n--- profile ---\n{}",
+            expected,
+            profile
+        );
+    }
+
+    /// Regression for the same T2 failure: when the intercept-CA path lives
+    /// under a protected root that emits `(deny file-read-data (subpath ...))`,
+    /// a plain `(allow file-read* (literal ...))` is shadowed because Seatbelt
+    /// ranks action specificity above path specificity. The proxy now emits
+    /// an action-matching `(allow file-read-data (literal ...))` platform rule
+    /// (plus metadata) so the per-file allow wins by both action specificity
+    /// and last-match. This test pins that ordering.
+    #[test]
+    fn intercept_ca_action_specific_allow_wins_over_protected_root_deny() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nono_root = tmp.path().join(".nono");
+        let session_dir = nono_root.join("sessions").join("intercept-test");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let ca_path = session_dir.join("intercept-ca.pem");
+        std::fs::write(&ca_path, b"fake").unwrap();
+
+        let canonical_root = nono_root.canonicalize().unwrap();
+        let canonical_ca = ca_path.canonicalize().unwrap();
+        let root_str = canonical_root.to_str().unwrap();
+        let ca_str = canonical_ca.to_str().unwrap();
+
+        let mut caps = CapabilitySet::new();
+        // Protected-root deny rules (mirroring `emit_protected_root_deny_rules`).
+        caps.add_platform_rule(format!(
+            "(allow file-read-metadata (subpath \"{}\"))",
+            root_str
+        ))
+        .unwrap();
+        caps.add_platform_rule(format!("(deny file-read-data (subpath \"{}\"))", root_str))
+            .unwrap();
+        caps.add_platform_rule(format!("(deny file-write* (subpath \"{}\"))", root_str))
+            .unwrap();
+        // Proxy's action-specific allow on the CA bundle.
+        caps.add_platform_rule(format!("(allow file-read-data (literal \"{}\"))", ca_str))
+            .unwrap();
+        caps.add_platform_rule(format!(
+            "(allow file-read-metadata (literal \"{}\"))",
+            ca_str
+        ))
+        .unwrap();
+
+        let profile = generate_profile(&caps).unwrap();
+        let allow_data = format!("(allow file-read-data (literal \"{}\"))", ca_str);
+        let deny_data = format!("(deny file-read-data (subpath \"{}\"))", root_str);
+
+        let allow_idx = profile.find(&allow_data).unwrap_or_else(|| {
+            panic!(
+                "profile missing action-specific allow `{}`\n\n--- profile ---\n{}",
+                allow_data, profile
+            )
+        });
+        let deny_idx = profile.find(&deny_data).unwrap_or_else(|| {
+            panic!(
+                "profile missing protected-root deny `{}`\n\n--- profile ---\n{}",
+                deny_data, profile
+            )
+        });
+        assert!(
+            allow_idx > deny_idx,
+            "action-specific allow must come AFTER the subpath deny so last-match wins.\n\
+             allow_idx={allow_idx}, deny_idx={deny_idx}\n\n--- profile ---\n{profile}"
+        );
+    }
+
     #[test]
     fn test_generate_profile_with_dir() {
         let mut caps = CapabilitySet::new();
@@ -1135,8 +1238,10 @@ mod tests {
         assert!(
             profile.contains("(allow file-read* (extension \"com.apple.app-sandbox.read-write\"))")
         );
-        assert!(profile
-            .contains("(allow file-write* (extension \"com.apple.app-sandbox.read-write\"))"));
+        assert!(
+            profile
+                .contains("(allow file-write* (extension \"com.apple.app-sandbox.read-write\"))")
+        );
     }
 
     #[test]
@@ -1240,8 +1345,11 @@ mod tests {
             profile.contains("(allow network-outbound (path \"/private/var/run/mDNSResponder\"))")
         );
         assert!(profile.contains("(allow network-outbound (path \"/var/run/mDNSResponder\"))"));
-        assert!(profile
-            .contains("(allow system-socket (socket-domain AF_UNIX) (socket-type SOCK_STREAM))"));
+        assert!(
+            profile.contains(
+                "(allow system-socket (socket-domain AF_UNIX) (socket-type SOCK_STREAM))"
+            )
+        );
         // Should NOT have general outbound allow
         assert!(!profile.contains("(allow network-outbound)\n"));
         // Should NOT have bind/inbound without bind_ports
@@ -1296,7 +1404,7 @@ mod tests {
         caps.add_unix_socket(crate::UnixSocketCapability {
             original: PathBuf::from("/tmp/test.sock"),
             resolved: PathBuf::from("/private/tmp/test.sock"),
-            is_directory: false,
+            scope: crate::SocketScope::File,
             mode: crate::UnixSocketMode::Connect,
             source: CapabilitySource::User,
         });
@@ -1321,7 +1429,7 @@ mod tests {
         caps.add_unix_socket(crate::UnixSocketCapability {
             original: PathBuf::from("/var/run/app.sock"),
             resolved: PathBuf::from("/private/var/run/app.sock"),
-            is_directory: false,
+            scope: crate::SocketScope::File,
             mode: crate::UnixSocketMode::ConnectBind,
             source: CapabilitySource::User,
         });
@@ -1360,7 +1468,7 @@ mod tests {
         caps.add_unix_socket(crate::UnixSocketCapability {
             original: PathBuf::from("/var/run/client.sock"),
             resolved: PathBuf::from("/private/var/run/client.sock"),
-            is_directory: false,
+            scope: crate::SocketScope::File,
             mode: crate::UnixSocketMode::Connect,
             source: CapabilitySource::User,
         });
@@ -1386,7 +1494,7 @@ mod tests {
         caps.add_unix_socket(crate::UnixSocketCapability {
             original: PathBuf::from("/tmp/mydir"),
             resolved: PathBuf::from("/private/tmp/mydir"),
-            is_directory: true,
+            scope: crate::SocketScope::DirChildren,
             mode: crate::UnixSocketMode::ConnectBind,
             source: CapabilitySource::User,
         });
@@ -1409,6 +1517,48 @@ mod tests {
         assert!(
             !profile.contains("(allow network-outbound (subpath"),
             "directory unix socket grants must NOT use recursive subpath"
+        );
+    }
+
+    #[test]
+    fn test_generate_profile_unix_socket_subtree_emits_subpath() {
+        let mut caps = CapabilitySet::new().proxy_only(54321);
+        caps.add_fs(FsCapability {
+            original: PathBuf::from("/tmp/mydir"),
+            resolved: PathBuf::from("/private/tmp/mydir"),
+            access: AccessMode::Read,
+            is_file: false,
+            source: CapabilitySource::User,
+        });
+        caps.add_unix_socket(crate::UnixSocketCapability {
+            original: PathBuf::from("/tmp/mydir"),
+            resolved: PathBuf::from("/private/tmp/mydir"),
+            scope: crate::SocketScope::DirSubtree,
+            mode: crate::UnixSocketMode::ConnectBind,
+            source: CapabilitySource::User,
+        });
+
+        let profile = generate_profile(&caps).unwrap();
+
+        assert!(
+            profile.contains("(allow network-outbound (subpath \"/private/tmp/mydir\"))"),
+            "subtree unix socket grants must emit recursive subpath: {profile}"
+        );
+        assert!(
+            profile.contains("(allow file-read* (subpath \"/private/tmp/mydir\"))"),
+            "subtree unix socket implied filesystem grant must allow recursive traversal: {profile}"
+        );
+        assert!(
+            profile.contains("(allow network-outbound (subpath \"/tmp/mydir\"))"),
+            "symlinked original must also emit subpath form"
+        );
+        assert!(
+            profile.contains("(allow network-bind (subpath \"/private/tmp/mydir\"))"),
+            "ConnectBind subtree grant must emit network-bind subpath"
+        );
+        assert!(
+            !profile.contains("(regex \"^/private/tmp/mydir/[^/]+$\")"),
+            "subtree grant must not use direct-child regex"
         );
     }
 
@@ -1485,7 +1635,7 @@ mod tests {
         caps.add_unix_socket(crate::UnixSocketCapability {
             original: PathBuf::from("/tmp/test.sock"),
             resolved: PathBuf::from("/private/tmp/test.sock"),
-            is_directory: false,
+            scope: crate::SocketScope::File,
             mode: crate::UnixSocketMode::Connect,
             source: CapabilitySource::User,
         });
@@ -1618,8 +1768,11 @@ mod tests {
             profile.contains("(allow network-outbound (path \"/private/var/run/mDNSResponder\"))")
         );
         assert!(profile.contains("(allow network-outbound (path \"/var/run/mDNSResponder\"))"));
-        assert!(profile
-            .contains("(allow system-socket (socket-domain AF_UNIX) (socket-type SOCK_STREAM))"));
+        assert!(
+            profile.contains(
+                "(allow system-socket (socket-domain AF_UNIX) (socket-type SOCK_STREAM))"
+            )
+        );
     }
 
     #[test]

@@ -6,8 +6,8 @@ use crate::audit_attestation::verify_audit_attestation;
 use crate::audit_integrity::verify_audit_log;
 use crate::audit_ledger::verify_session_in_ledger;
 use crate::audit_session::{
-    discover_sessions, format_bytes, is_legacy_audit_only_session, is_primary_audit_session,
-    load_session, remove_session, SessionInfo,
+    SessionInfo, discover_sessions, format_bytes, is_legacy_audit_only_session,
+    is_primary_audit_session, load_session, remove_session,
 };
 use crate::cli::{
     AuditArgs, AuditCleanupArgs, AuditCommands, AuditListArgs, AuditShowArgs, AuditVerifyArgs,
@@ -746,6 +746,7 @@ fn change_symbol(ct: &nono::undo::ChangeType) -> colored::ColoredString {
 fn network_mode_label(mode: &nono::undo::NetworkAuditMode) -> &'static str {
     match mode {
         nono::undo::NetworkAuditMode::Connect => "connect",
+        nono::undo::NetworkAuditMode::ConnectIntercept => "connect_intercept",
         nono::undo::NetworkAuditMode::Reverse => "reverse",
         nono::undo::NetworkAuditMode::External => "external",
     }

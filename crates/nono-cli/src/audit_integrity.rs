@@ -20,6 +20,8 @@ pub(crate) enum AuditEventPayload {
     SessionStarted {
         started: String,
         command: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        redaction_policy: Option<nono::ScrubPolicyDiff>,
     },
     SessionEnded {
         ended: String,
@@ -68,10 +70,19 @@ pub(crate) struct AuditRecorder {
     next_sequence: u64,
     previous_chain: Option<ContentHash>,
     leaf_hashes: Vec<ContentHash>,
+    redaction_policy: nono::ScrubPolicy,
 }
 
 impl AuditRecorder {
+    #[cfg(test)]
     pub(crate) fn new(session_dir: PathBuf) -> Result<Self> {
+        Self::new_with_policy(session_dir, nono::ScrubPolicy::secure_default())
+    }
+
+    pub(crate) fn new_with_policy(
+        session_dir: PathBuf,
+        redaction_policy: nono::ScrubPolicy,
+    ) -> Result<Self> {
         let path = session_dir.join(AUDIT_EVENTS_FILENAME);
         let file = OpenOptions::new()
             .create(true)
@@ -88,6 +99,7 @@ impl AuditRecorder {
             next_sequence: 0,
             previous_chain: None,
             leaf_hashes: Vec::new(),
+            redaction_policy,
         })
     }
 
@@ -96,7 +108,14 @@ impl AuditRecorder {
         started: String,
         command: Vec<String>,
     ) -> Result<()> {
-        self.append_event(AuditEventPayload::SessionStarted { started, command })
+        self.append_event(AuditEventPayload::SessionStarted {
+            started,
+            command: nono::scrub_argv_with_policy(&command, &self.redaction_policy),
+            redaction_policy: self
+                .redaction_policy
+                .diff_from_secure_default()
+                .into_option(),
+        })
     }
 
     pub(crate) fn record_session_ended(&mut self, ended: String, exit_code: i32) -> Result<()> {
@@ -346,20 +365,20 @@ pub(crate) fn verify_audit_log(
         .map(|count| count == event_count)
         .unwrap_or(true);
 
-    if let Some(stored_head) = stored_chain_head {
-        if Some(stored_head) != computed_chain_head {
-            return Err(NonoError::Snapshot(
-                "Alpha audit log chain head mismatch".to_string(),
-            ));
-        }
+    if let Some(stored_head) = stored_chain_head
+        && Some(stored_head) != computed_chain_head
+    {
+        return Err(NonoError::Snapshot(
+            "Alpha audit log chain head mismatch".to_string(),
+        ));
     }
 
-    if let Some(stored_root) = stored_merkle_root {
-        if Some(stored_root) != computed_merkle_root {
-            return Err(NonoError::Snapshot(
-                "Alpha audit log Merkle root mismatch".to_string(),
-            ));
-        }
+    if let Some(stored_root) = stored_merkle_root
+        && Some(stored_root) != computed_merkle_root
+    {
+        return Err(NonoError::Snapshot(
+            "Alpha audit log Merkle root mismatch".to_string(),
+        ));
     }
 
     Ok(AuditVerificationResult {
@@ -380,9 +399,9 @@ pub(crate) fn verify_audit_log(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use nono::AccessMode;
     use nono::supervisor::{ApprovalDecision, AuditEntry, CapabilityRequest, UrlOpenRequest};
     use nono::undo::{NetworkAuditDecision, NetworkAuditEvent, NetworkAuditMode};
-    use nono::AccessMode;
     use std::path::PathBuf;
     use std::time::{Duration, UNIX_EPOCH};
 
@@ -411,6 +430,61 @@ mod tests {
             .unwrap();
 
         assert_eq!(recorder.event_count(), 1);
+    }
+
+    #[test]
+    fn record_session_started_scrubs_command_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recorder = AuditRecorder::new(dir.path().to_path_buf()).unwrap();
+        recorder
+            .record_session_started(
+                "2026-04-21T00:00:00Z".to_string(),
+                vec![
+                    "curl".to_string(),
+                    "--password".to_string(),
+                    "real-password".to_string(),
+                    "-H".to_string(),
+                    "Authorization: Bearer real-token".to_string(),
+                    "https://example.com/api?token=query-secret".to_string(),
+                ],
+            )
+            .unwrap();
+
+        let contents = std::fs::read_to_string(dir.path().join(AUDIT_EVENTS_FILENAME)).unwrap();
+
+        assert!(contents.contains("[REDACTED]"));
+        assert!(!contents.contains("real-password"));
+        assert!(!contents.contains("real-token"));
+        assert!(!contents.contains("query-secret"));
+    }
+
+    #[test]
+    fn record_session_started_uses_configured_redaction_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut redactions = nono::ScrubPolicy::secure_default();
+        redactions.add_flag("--private-token");
+        redactions.remove_query_key("state");
+        let mut recorder =
+            AuditRecorder::new_with_policy(dir.path().to_path_buf(), redactions).unwrap();
+        recorder
+            .record_session_started(
+                "2026-04-21T00:00:00Z".to_string(),
+                vec![
+                    "curl".to_string(),
+                    "--private-token=private-secret".to_string(),
+                    "https://example.com/callback?state=visible&token=hidden".to_string(),
+                ],
+            )
+            .unwrap();
+
+        let contents = std::fs::read_to_string(dir.path().join(AUDIT_EVENTS_FILENAME)).unwrap();
+
+        assert!(contents.contains("--private-token=[REDACTED]"));
+        assert!(contents.contains("state=visible"));
+        assert!(contents.contains("\"added_flags\":[\"--private-token\"]"));
+        assert!(contents.contains("\"removed_query_keys\":[\"state\"]"));
+        assert!(!contents.contains("private-secret"));
+        assert!(!contents.contains("token=hidden"));
     }
 
     #[test]
@@ -458,6 +532,12 @@ mod tests {
                 timestamp_unix_ms: 123,
                 mode: NetworkAuditMode::Reverse,
                 decision: NetworkAuditDecision::Deny,
+                route_id: None,
+                auth_mechanism: None,
+                auth_outcome: None,
+                managed_credential_active: None,
+                injection_mode: None,
+                denial_category: None,
                 target: "api.example.com".to_string(),
                 port: Some(443),
                 method: Some("POST".to_string()),
@@ -507,8 +587,9 @@ mod tests {
             Ok(_) => panic!("alpha verification should reject records missing event_json"),
             Err(err) => err,
         };
-        assert!(err
-            .to_string()
-            .contains("missing canonical event_json bytes"));
+        assert!(
+            err.to_string()
+                .contains("missing canonical event_json bytes")
+        );
     }
 }

@@ -1,5 +1,220 @@
 # Changelog
 
+## Unreleased
+
+### Notes
+
+- Socket grant state now records explicit socket scope. New subtree socket
+  grants require this metadata; rolling back to older nono builds may read
+  those state entries as file-scoped grants.
+
+## [0.54.0] - 2026-05-13
+
+### Bug Fixes
+
+- *(pack-update-hint)* Treat unparsable installed as older in update check
+
+- Macos lint
+
+- Macos lint
+
+- Macos lint
+
+- *(snapshot)* Validate restore targets against symlinks
+
+- *(platform)* Correctly parse windows registry dword values
+
+
+### Dependencies
+
+- *(deps)* Bump nix from 0.31.2 to 0.31.3
+
+- *(deps)* Bump sigstore/cosign-installer from 4.1.1 to 4.1.2
+
+- *(deps)* Bump tokio from 1.52.2 to 1.52.3
+
+
+### Features
+
+- *(pack-hints)* Document inline pack update hints
+
+- *(pack_update_hint)* Refresh hints synchronously on first run
+
+- *(packs)* Add pinning, outdated, and clarify publishing versioning
+
+- *(cli)* Implement `nono update` command
+
+- *(package)* Add package pinning and outdated commands
+
+- Upgrade to Rust edition 2024, centralize workspace dependencies
+
+- *(platform)* Implement robust windows platform detection
+
+- *(profile)* Add platform-conditional profile fields
+
+
+### Style
+
+- *(cli)* Adjust line breaks and module order
+
+- *(cli)* Improve formatting and simplify error handling
+
+## [0.53.0] - 2026-05-11
+
+### Bug Fixes
+
+- Absolute match / 2 matches = deny / no match = passthrough w no creds
+
+- Review comments
+
+- Return full failure diagnostic
+
+- *(sandbox)* Cache Landlock ABI detection with OnceLock
+
+
+### Features
+
+- Fix upstream TLS trust, intercept auth, and multi-route dispatch.
+
+- *(core)* Scrub command arguments for secrets
+
+
+### Refactoring
+
+- *(scrub)* Optimize and simplify scrubbing logic
+
+## [0.52.2] - 2026-05-11
+
+### Bug Fixes
+
+- *(profile-save)* Address suppression review feedback
+
+
+### Features
+
+- *(profile-save)* Suppress save-profile prompts for denied paths
+
+
+### Miscellaneous
+
+- Release v0.52.1
+
+## [0.52.1] - 2026-05-11
+
+### Bug Fixes
+
+- *(profile-save)* Address suppression review feedback
+
+
+### Features
+
+- *(profile-save)* Suppress save-profile prompts for denied paths
+
+## [0.52.1] - 2026-05-11
+
+### Bug Fixes
+
+- Match backend validation logic
+
+- *(schema)* Add missing 'environment' property to profile JSON schema
+
+- *(proxy)* Set NODE_USE_ENV_PROXY for Node 26
+
+- *(policy)* Expand browser deny groups with missing Chromium-based browsers
+
+- Preserve two keyboard-mode resets
+
+- Documented concat! blocks instead of opaque byte blobs
+
+- *(pty)* Stop clearing terminal scrollback on exit for normal-mode sessions
+
+- Provide more accurate warning message + doc comment update
+
+- *(cli)* Validate --allow paths and persist domain allowlist in sandbox state
+
+- *(cli)* Make 'nono why --host' aware of proxy domain filtering
+
+- Prevent feature unification from linking libdbus in no-keyring builds
+
+
+### Documentation
+
+- *(agents)* Relax agent disclosure and expand campaign ban
+
+## [0.52.0] - 2026-05-10
+
+### Bug Fixes
+
+- *(diagnostic)* Parse escaped quotes in structured properties
+
+- *(env)* Preserve fail-closed semantics for empty allow_vars
+
+- *(lint)* Replace unwrap() with is_some_and() in test
+
+
+### Documentation
+
+- *(environment)* Document empty allow_vars array behavior
+
+- Restructure navigation and fix stale terminology
+
+
+### Features
+
+- *(cli)* Deprecate 'nono learn' and improve diagnostics
+
+- *(cli)* Enhance interactive experience and profile saving
+
+- *(cli)* Enhance macos learn and run diagnostics
+
+- *(env)* Add operator-controlled deny_vars to EnvironmentConfig
+
+
+### Refactoring
+
+- *(env)* Extract matches_env_var_patterns helper, fix docs wording
+
+
+### Style
+
+- Run cargo fmt
+
+## [0.51.0] - 2026-05-09
+
+### Bug Fixes
+
+- *(tls_intercept)* Add authority key identifier to leaf certs
+
+
+### Features
+
+- *(proxy)* Extend ca trust to git clients
+
+- *(proxy)* Enhance audit context for managed auth and harden tls ca dir
+
+- *(audit)* Add structured context to network audit events
+
+- *(proxy)* Add tls interception for l7-bearing connect routes
+
+## [0.50.1] - 2026-05-08
+
+### Bug Fixes
+
+- Use native types for iotcl integers
+
+## [0.50.0] - 2026-05-08
+
+### Features
+
+- *(profile)* Support env:// URI in custom_credentials credential_key
+
+
+### Refactoring
+
+- *(cli)* Optimize ps command column width calculation
+
+- *(cli/ps)* Improve ps command display with dynamic columns
+
 ## [0.49.0] - 2026-05-07
 
 ### Bug Fixes

@@ -16,7 +16,7 @@
 //! The supervisor proxies I/O between whoever is connected and the PTY master.
 
 use nix::libc;
-use nix::pty::{openpty, OpenptyResult, Winsize};
+use nix::pty::{OpenptyResult, Winsize, openpty};
 use nix::sys::signal::{self, SigHandler, Signal};
 use nono::{NonoError, Result};
 use std::collections::VecDeque;
@@ -25,7 +25,7 @@ use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 #[cfg(unix)]
@@ -43,11 +43,65 @@ const ATTACH_ACK_BUSY: u8 = 1;
 const ATTACH_ACK_DENIED: u8 = 2;
 const ATTACH_REQUEST_ATTACH: u8 = 0;
 const ATTACH_REQUEST_DETACH: u8 = 1;
-const ATTACH_SCREEN_ENTER_ESCAPE: &[u8] =
-    b"\x1b[0m\x1b(B\x1b)B\x0f\x1b[r\x1b[?6l\x1b[?1049h\x1b[?25h\x1b[2J\x1b[H";
-const TERMINAL_RESTORE_ESCAPE: &[u8] = b"\x1b[<u\x1b[>0n\x1b[>1n\x1b[>2n\x1b[>3n\x1b[>4n\x1b[>6n\x1b[>7n\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1004l\x1b[?2004l\x1b[?1049l\x1b[?25h";
-const TERMINAL_RESTORE_AND_CLEAR_ESCAPE: &[u8] =
-    b"\x1b[<u\x1b[>0n\x1b[>1n\x1b[>2n\x1b[>3n\x1b[>4n\x1b[>6n\x1b[>7n\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1004l\x1b[?2004l\x1b[?1l\x1b>\x1b[?1049l\x1b[?25h\x1b[2J\x1b[H";
+// Composed terminal escape sequences. Each concat! block documents its
+// individual CSI sequences inline so the byte-level intent is auditable
+// without having to decode raw hex.
+const ENTER_ALT_SCREEN: &str = "\x1b[?1049h";
+const EXIT_ALT_SCREEN: &str = "\x1b[?1049l";
+
+const ATTACH_SCREEN_ENTER_ESCAPE: &[u8] = concat!(
+    "\x1b[0m",       // reset attributes
+    "\x1b(B\x1b)B",  // set G0/G1 charset to ASCII
+    "\x0f",          // shift-in (select G0)
+    "\x1b[r",        // reset scroll region
+    "\x1b[?6l",      // disable origin mode
+    "\x1b[?1049h",   // enter alternate screen
+    "\x1b[?25h",     // show cursor
+    "\x1b[2J\x1b[H", // clear screen + cursor home
+)
+.as_bytes();
+
+const TERMINAL_RESTORE_NORMAL: &[u8] = concat!(
+    "\x1b[<u", // restore cursor (kitty private)
+    "\x1b[>0n\x1b[>1n\x1b[>2n\x1b[>3n\x1b[>4n\x1b[>6n\x1b[>7n", // disable key reporting
+    "\x1b[?1000l\x1b[?1002l\x1b[?1003l", // disable mouse tracking
+    "\x1b[?1005l\x1b[?1006l\x1b[?1015l", // disable mouse encodings
+    "\x1b[?1004l", // disable focus events
+    "\x1b[?2004l", // disable bracketed paste
+    "\x1b[?1l", // disable application cursor keys
+    "\x1b>",   // normal keypad mode
+    "\x1b[?25h", // show cursor
+)
+.as_bytes();
+
+const TERMINAL_RESTORE_ESCAPE: &[u8] = concat!(
+    "\x1b[<u", // restore cursor (kitty private)
+    "\x1b[>0n\x1b[>1n\x1b[>2n\x1b[>3n\x1b[>4n\x1b[>6n\x1b[>7n", // disable key reporting
+    "\x1b[?1000l\x1b[?1002l\x1b[?1003l", // disable mouse tracking
+    "\x1b[?1005l\x1b[?1006l\x1b[?1015l", // disable mouse encodings
+    "\x1b[?1004l", // disable focus events
+    "\x1b[?2004l", // disable bracketed paste
+    "\x1b[?1049l", // exit alternate screen
+    "\x1b[?25h", // show cursor
+)
+.as_bytes();
+
+const TERMINAL_RESTORE_AND_CLEAR_ESCAPE: &[u8] = concat!(
+    "\x1b[<u", // restore cursor (kitty private)
+    "\x1b[>0n\x1b[>1n\x1b[>2n\x1b[>3n\x1b[>4n\x1b[>6n\x1b[>7n", // disable key reporting
+    "\x1b[?1000l\x1b[?1002l\x1b[?1003l", // disable mouse tracking
+    "\x1b[?1005l\x1b[?1006l\x1b[?1015l", // disable mouse encodings
+    "\x1b[?1004l", // disable focus events
+    "\x1b[?2004l", // disable bracketed paste
+    "\x1b[?1l", // disable application cursor keys
+    "\x1b>",   // normal keypad mode
+    "\x1b[?1049l", // exit alternate screen
+    "\x1b[?25h", // show cursor
+    "\x1b[2J\x1b[H", // clear screen + cursor home
+)
+.as_bytes();
+
+const CLEAR_PARENT_OUTPUT_AREA: &[u8] = b"\r\x1b[K\x1b[J";
 
 static ATTACH_RESIZE_PIPE_READ: AtomicI32 = AtomicI32::new(-1);
 static ATTACH_RESIZE_PIPE_WRITE: AtomicI32 = AtomicI32::new(-1);
@@ -71,6 +125,12 @@ enum AttachedClient {
 enum ReadFdOutcome {
     Data(usize),
     Eof,
+    Retry,
+}
+
+enum MasterProxyOutcome {
+    Data,
+    Closed,
     Retry,
 }
 
@@ -187,50 +247,55 @@ pub fn open_pty() -> Result<PtyPair> {
     Ok(PtyPair { master, slave })
 }
 
+/// Write a message to stderr and abort the child process.
+///
+/// Async-signal-safe: only uses raw `write(2)` and `_exit(2)`.
+fn child_setup_pty_fatal(message: &[u8]) -> ! {
+    // SAFETY: message slice pointer is valid for its length; write(2) and
+    // _exit(2) are async-signal-safe and cannot cause memory unsafety.
+    unsafe {
+        let _ = libc::write(
+            libc::STDERR_FILENO,
+            message.as_ptr().cast::<libc::c_void>(),
+            message.len(),
+        );
+        libc::_exit(126);
+    }
+}
+
 /// Set up the slave PTY as the child's controlling terminal.
 ///
 /// Must be called in the child after fork, before exec.
-/// This is async-signal-safe (only uses raw libc calls).
 ///
 /// # Safety
-/// Must be called in the child process after fork. The slave_fd must be valid.
-unsafe fn child_setup_pty_fatal(message: &[u8]) -> ! {
-    let _ = libc::write(
-        libc::STDERR_FILENO,
-        message.as_ptr().cast::<libc::c_void>(),
-        message.len(),
-    );
-    libc::_exit(126);
-}
-
-/// # Safety
-/// Must be called in the child process after fork. The slave_fd must be valid.
+/// Must be called in a freshly-forked child process. `slave_fd` must be a
+/// valid open file descriptor for the slave side of a PTY pair.
 pub unsafe fn setup_child_pty(slave_fd: RawFd) {
-    // Create a new session so the child can acquire a controlling terminal.
-    if libc::setsid() < 0 {
+    if nix::unistd::setsid().is_err() {
         child_setup_pty_fatal(b"nono: setsid() failed while configuring child PTY\n");
     }
 
-    // Set the slave as the controlling terminal (TIOCSCTTY).
-    // The arg 0 means "don't steal if another process has it".
-    if libc::ioctl(slave_fd, libc::TIOCSCTTY as libc::c_ulong, 0) < 0 {
-        child_setup_pty_fatal(b"nono: ioctl(TIOCSCTTY) failed while configuring child PTY\n");
-    }
+    // SAFETY: post-fork child; slave_fd is valid per caller contract.
+    // ioctl/dup2/close operate on raw fd integers — nix's IO-safe wrappers
+    // require AsFd/OwnedFd which aren't available for STDIN_FILENO et al.
+    unsafe {
+        if libc::ioctl(slave_fd, libc::TIOCSCTTY as libc::c_ulong, 0) < 0 {
+            child_setup_pty_fatal(b"nono: ioctl(TIOCSCTTY) failed while configuring child PTY\n");
+        }
 
-    // Redirect stdin/stdout/stderr to the slave PTY
-    if libc::dup2(slave_fd, libc::STDIN_FILENO) < 0 {
-        child_setup_pty_fatal(b"nono: dup2(stdin) failed while configuring child PTY\n");
-    }
-    if libc::dup2(slave_fd, libc::STDOUT_FILENO) < 0 {
-        child_setup_pty_fatal(b"nono: dup2(stdout) failed while configuring child PTY\n");
-    }
-    if libc::dup2(slave_fd, libc::STDERR_FILENO) < 0 {
-        child_setup_pty_fatal(b"nono: dup2(stderr) failed while configuring child PTY\n");
-    }
+        if libc::dup2(slave_fd, libc::STDIN_FILENO) < 0 {
+            child_setup_pty_fatal(b"nono: dup2(stdin) failed while configuring child PTY\n");
+        }
+        if libc::dup2(slave_fd, libc::STDOUT_FILENO) < 0 {
+            child_setup_pty_fatal(b"nono: dup2(stdout) failed while configuring child PTY\n");
+        }
+        if libc::dup2(slave_fd, libc::STDERR_FILENO) < 0 {
+            child_setup_pty_fatal(b"nono: dup2(stderr) failed while configuring child PTY\n");
+        }
 
-    // Close the original slave fd if it's not one of 0/1/2
-    if slave_fd > 2 {
-        libc::close(slave_fd);
+        if slave_fd > 2 {
+            libc::close(slave_fd);
+        }
     }
 }
 
@@ -346,14 +411,31 @@ impl PtyProxy {
             return false;
         }
 
-        leave_attach_screen();
+        let in_alt_screen = self.screen.alternate_screen_active();
+        leave_attach_screen(in_alt_screen);
         self.restore_terminal();
+        // If the child's last output had no trailing newline, `\r\x1b[K` inside
+        // `prepare_parent_output_area` would erase it.  Emit a newline first so
+        // the child's output is preserved.  Skip in alt-screen: the terminal
+        // restores the normal-screen cursor on exit, making the column moot.
+        if !in_alt_screen {
+            let (_row, col) = self.screen.cursor_position();
+            if col > 0 {
+                let _ = write_all_fd(libc::STDOUT_FILENO, b"\n");
+            }
+        }
+        prepare_parent_output_area();
         self.client = None;
         self.resize_notifier = None;
         self.pending_detach_match_len = 0;
         self.pending_detach_escape.clear();
         self.persist_attachment_state(crate::session::SessionAttachment::Detached);
         true
+    }
+
+    /// Whether the child process is currently using the alternate screen buffer.
+    pub fn in_alt_screen(&self) -> bool {
+        self.screen.alternate_screen_active()
     }
 
     /// Shut down the attach listener so no new connections can be accepted.
@@ -427,9 +509,10 @@ impl PtyProxy {
                         }
                     }
                     ATTACH_REQUEST_DETACH => {
+                        let in_alt = self.screen.alternate_screen_active();
                         let detached_terminal = self.detach();
                         if detached_terminal {
-                            write_detach_terminal_reset(libc::STDOUT_FILENO);
+                            write_detach_terminal_reset(libc::STDOUT_FILENO, in_alt);
                             write_detach_notice(libc::STDERR_FILENO);
                         }
                         let _ = stream.write_all(&[ATTACH_ACK_OK]);
@@ -539,6 +622,13 @@ impl PtyProxy {
     /// Returns false if the PTY master became unavailable.
     #[must_use = "false indicates the PTY master is no longer usable"]
     pub fn proxy_master_to_client(&mut self) -> bool {
+        !matches!(
+            self.proxy_master_to_client_once(),
+            MasterProxyOutcome::Closed
+        )
+    }
+
+    fn proxy_master_to_client_once(&mut self) -> MasterProxyOutcome {
         let client = self
             .client
             .as_ref()
@@ -547,34 +637,87 @@ impl PtyProxy {
         let mut buf = [0u8; 4096];
         let n = match read_fd_once(self.master.as_raw_fd(), &mut buf) {
             Ok(ReadFdOutcome::Data(n)) => n,
-            Ok(ReadFdOutcome::Eof) => return false,
-            Ok(ReadFdOutcome::Retry) => return true,
+            Ok(ReadFdOutcome::Eof) => return MasterProxyOutcome::Closed,
+            Ok(ReadFdOutcome::Retry) => return MasterProxyOutcome::Retry,
             Err(err) => {
                 debug!("PTY proxy: failed reading PTY master: {}", err);
-                return false;
+                return MasterProxyOutcome::Closed;
             }
         };
 
         self.record_output(&buf[..n]);
 
-        if let Some((write_fd, is_terminal)) = client {
-            if let Err(err) = write_all_fd(write_fd, &buf[..n]) {
-                if is_terminal {
-                    warn!(
-                        "PTY proxy: terminal output write failed for session {}: {}; detaching terminal client",
-                        self.session_id, err
-                    );
-                    self.detach();
-                    return true;
-                } else {
-                    debug!("PTY proxy: attached socket client disconnected: {}", err);
-                    self.detach();
-                    return true;
-                }
+        if let Some((write_fd, is_terminal)) = client
+            && let Err(err) = write_all_fd(write_fd, &buf[..n])
+        {
+            if is_terminal {
+                warn!(
+                    "PTY proxy: terminal output write failed for session {}: {}; detaching terminal client",
+                    self.session_id, err
+                );
+                self.detach();
+                return MasterProxyOutcome::Data;
+            } else {
+                debug!("PTY proxy: attached socket client disconnected: {}", err);
+                self.detach();
+                return MasterProxyOutcome::Data;
             }
         }
 
-        true
+        MasterProxyOutcome::Data
+    }
+
+    /// Drain child output still queued on the PTY master after the child exits.
+    ///
+    /// `waitpid` can report the child exit before the supervisor has relayed the
+    /// final terminal bytes. Draining here keeps parent-owned diagnostics and
+    /// prompts ordered after the application's own stderr/stdout.
+    pub fn drain_master_output(&mut self, quiet_timeout: Duration) {
+        let mut quiet_deadline = Instant::now() + quiet_timeout;
+
+        loop {
+            let now = Instant::now();
+            if now >= quiet_deadline {
+                break;
+            }
+            let remaining = quiet_deadline.saturating_duration_since(now);
+            let timeout_ms = remaining.as_millis().min(i32::MAX as u128) as i32;
+            let mut pfd = libc::pollfd {
+                fd: self.master.as_raw_fd(),
+                events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+                revents: 0,
+            };
+
+            let ret = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+            if ret > 0 {
+                if pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+                    match self.proxy_master_to_client_once() {
+                        MasterProxyOutcome::Data => {
+                            quiet_deadline = Instant::now() + quiet_timeout;
+                            continue;
+                        }
+                        MasterProxyOutcome::Retry => {
+                            if pfd.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+                                break;
+                            }
+                            continue;
+                        }
+                        MasterProxyOutcome::Closed => break,
+                    }
+                }
+                if pfd.revents & libc::POLLNVAL != 0 {
+                    break;
+                }
+            } else if ret == 0 {
+                break;
+            } else {
+                let err = std::io::Error::last_os_error();
+                if err.kind() != std::io::ErrorKind::Interrupted {
+                    debug!("PTY proxy: post-exit drain poll failed: {}", err);
+                    break;
+                }
+            }
+        }
     }
 
     /// Proxy data from the attached client to the PTY master (user → child).
@@ -620,14 +763,14 @@ impl PtyProxy {
         };
 
         let forwarded = self.filter_client_input(&buf[..n]);
-        if !forwarded.is_empty() {
-            if let Err(err) = write_all_fd(self.master.as_raw_fd(), &forwarded) {
-                warn!(
-                    "PTY proxy: failed forwarding client input to PTY master for session {}: {}",
-                    self.session_id, err
-                );
-                return false;
-            }
+        if !forwarded.is_empty()
+            && let Err(err) = write_all_fd(self.master.as_raw_fd(), &forwarded)
+        {
+            warn!(
+                "PTY proxy: failed forwarding client input to PTY master for session {}: {}",
+                self.session_id, err
+            );
+            return false;
         }
 
         true
@@ -648,7 +791,7 @@ impl PtyProxy {
             .as_ref()
             .is_some_and(AttachedClient::is_terminal)
         {
-            leave_attach_screen();
+            leave_attach_screen(self.screen.alternate_screen_active());
             self.restore_terminal();
             true
         } else {
@@ -695,10 +838,9 @@ impl PtyProxy {
             .client
             .as_ref()
             .is_some_and(AttachedClient::is_terminal)
+            && let Some(winsize) = get_terminal_winsize()
         {
-            if let Some(winsize) = get_terminal_winsize() {
-                let _ = self.apply_winsize(&winsize);
-            }
+            let _ = self.apply_winsize(&winsize);
         }
     }
 
@@ -810,17 +952,33 @@ impl PtyProxy {
         self.screen.render()
     }
 
-    /// Return the current screen content as plain text for diagnostic analysis.
+    /// Return captured terminal output as plain text for diagnostic analysis.
     ///
     /// Called after the child exits so the supervisor can search for
     /// sandbox-related error messages in the terminal output.
     pub fn screen_plaintext(&self) -> String {
-        self.screen.render_plaintext()
+        let mut captured = Vec::with_capacity(self.scrollback.len());
+        captured.extend(self.scrollback.iter().copied());
+        let scrollback = String::from_utf8_lossy(&captured).into_owned();
+        let screen = self.screen.render_plaintext();
+
+        if scrollback.trim().is_empty() {
+            return screen;
+        }
+
+        if screen.trim().is_empty() || scrollback.contains(screen.trim_end()) {
+            return scrollback;
+        }
+
+        format!("{scrollback}\n{screen}")
     }
 
-    /// Returns true once the child has emitted any PTY output.
-    pub fn has_observed_output(&self) -> bool {
-        !self.scrollback.is_empty()
+    /// Returns true once the child has rendered visible terminal content.
+    pub fn has_visible_output(&self) -> bool {
+        self.screen
+            .render_plaintext()
+            .chars()
+            .any(|ch| !ch.is_whitespace())
     }
 
     fn attach_replay_bytes(&self) -> Vec<u8> {
@@ -1139,7 +1297,7 @@ fn compose_replay_body(
     }
 }
 
-/// `CSI 3 J` — erase saved lines (xterm). Wipes the outer terminal's native
+/// CSI 3 J — erase saved lines (xterm). Wipes the outer terminal's native
 /// scrollback buffer without touching the currently visible area.
 const ERASE_NATIVE_SCROLLBACK: &[u8] = b"\x1b[3J";
 
@@ -1274,10 +1432,9 @@ impl Drop for PtyProxy {
             .as_ref()
             .is_some_and(AttachedClient::is_terminal)
         {
-            write_detach_terminal_reset(libc::STDOUT_FILENO);
+            write_detach_terminal_reset(libc::STDOUT_FILENO, self.screen.alternate_screen_active());
         }
         self.restore_terminal();
-        // Clean up the attach socket
         let _ = std::fs::remove_file(&self.attach_path);
     }
 }
@@ -1338,8 +1495,8 @@ struct AltScreenTracker {
     tail: Vec<u8>,
 }
 
-const ALT_SCREEN_ENTER_SEQ: &[u8] = b"\x1b[?1049h";
-const ALT_SCREEN_EXIT_SEQ: &[u8] = b"\x1b[?1049l";
+const ALT_SCREEN_ENTER_SEQ: &[u8] = ENTER_ALT_SCREEN.as_bytes();
+const ALT_SCREEN_EXIT_SEQ: &[u8] = EXIT_ALT_SCREEN.as_bytes();
 
 impl AltScreenTracker {
     fn observe(&mut self, bytes: &[u8]) {
@@ -1512,16 +1669,28 @@ fn recv_attach_resize_socket(stream: &UnixStream) -> Result<Option<UnixDatagram>
     Ok(Some(socket))
 }
 
-fn leave_attach_screen() {
-    let esc = terminal_restore_escape(false);
+fn leave_attach_screen(in_alt_screen: bool) {
+    let esc = if in_alt_screen {
+        terminal_restore_escape(false)
+    } else {
+        TERMINAL_RESTORE_NORMAL
+    };
     let _ = write_all_fd(libc::STDOUT_FILENO, esc);
+    drain_terminal_output(libc::STDOUT_FILENO);
 }
 
-pub(crate) fn write_detach_terminal_reset(fd: RawFd) {
-    let esc = terminal_restore_escape(true);
-    unsafe {
-        libc::write(fd, esc.as_ptr().cast(), esc.len());
-    }
+fn prepare_parent_output_area() {
+    let _ = write_all_fd(libc::STDOUT_FILENO, CLEAR_PARENT_OUTPUT_AREA);
+    drain_terminal_output(libc::STDOUT_FILENO);
+}
+
+pub(crate) fn write_detach_terminal_reset(fd: RawFd, in_alt_screen: bool) {
+    let esc = if in_alt_screen {
+        terminal_restore_escape(true)
+    } else {
+        TERMINAL_RESTORE_NORMAL
+    };
+    let _ = write_all_fd(fd, esc);
 }
 
 pub(crate) fn write_detach_notice(fd: RawFd) {
@@ -1536,6 +1705,26 @@ pub(crate) fn terminal_restore_escape(clear_screen: bool) -> &'static [u8] {
         TERMINAL_RESTORE_AND_CLEAR_ESCAPE
     } else {
         TERMINAL_RESTORE_ESCAPE
+    }
+}
+
+fn drain_terminal_output(fd: RawFd) {
+    // SAFETY: `isatty` only inspects the borrowed fd and does not take ownership.
+    if unsafe { libc::isatty(fd) } != 1 {
+        return;
+    }
+
+    loop {
+        // SAFETY: `tcdrain` waits for queued terminal output on the borrowed fd.
+        let ret = unsafe { libc::tcdrain(fd) };
+        if ret == 0 {
+            break;
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::Interrupted {
+            debug!("PTY proxy: terminal output drain failed: {}", err);
+            break;
+        }
     }
 }
 
@@ -1919,35 +2108,33 @@ where
     };
 
     // Restore the terminal. If the child was in alt-screen mode at detach
-    // (vim, htop, …), the `\x1b[?1049l` in the non-clearing restore escape
-    // already exits the alt buffer, which most terminals implement as
-    // "restore the saved main-screen contents" — exactly the pre-attach view
-    // the user wants back. In that case we must NOT clear, or we wipe that
-    // restored state. For normal-screen sessions (shells, Claude Code) the
-    // `\x1b[?1049l` is a no-op and the clear is what scrubs residual UI
-    // (half-drawn prompts, cursor blocks) that would otherwise be left
-    // behind. Then put termios back into cooked mode so the subsequent
-    // detach notice renders with proper \r\n handling.
-    let clear_on_restore = !alt_screen_tracker.in_alt_screen;
-    if clear_on_restore {
-        // Before we clear, push the current viewport into the native
-        // scrollback via SU (DEC Scroll Up) so the user can reach the full
-        // final view of the session by scrolling back after detach.
-        // Without this, TUIs like Claude Code that paint in place never
-        // cause the viewport to scroll out of the top during live use, so
-        // those lines never entered native scrollback — and the clear
-        // would wipe them permanently. With SU they land in scrollback
-        // first, then the clear operates on an empty viewport.
-        if let Some(winsize) = get_terminal_winsize() {
-            if winsize.ws_row > 0 {
-                let scroll_up = format!("\x1b[{}S", winsize.ws_row);
-                let _ = write_all_fd(libc::STDOUT_FILENO, scroll_up.as_bytes());
-            }
+    // (vim, htop, …), the `\x1b[?1049l` exits the alt buffer and most
+    // terminals restore the saved main-screen contents — exactly the
+    // pre-attach view the user wants back. In that case we must NOT clear,
+    // or we wipe that restored state. For normal-screen sessions we must
+    // NOT send `\x1b[?1049l` at all: on VTE-based terminals (GNOME
+    // Terminal, Tilix, etc.) an unsolicited alt-screen exit restores an
+    // empty/uninitialized saved buffer, destroying the scrollback.
+    let in_alt_screen = alt_screen_tracker.in_alt_screen;
+    if !in_alt_screen {
+        // Normal-screen: push the viewport into native scrollback via DEC
+        // Scroll Up so the user can reach the full final session view by
+        // scrolling back. Then restore terminal modes without touching the
+        // alternate screen buffer.
+        if let Some(winsize) = get_terminal_winsize()
+            && winsize.ws_row > 0
+        {
+            let scroll_up = format!("\x1b[{}S", winsize.ws_row);
+            let _ = write_all_fd(libc::STDOUT_FILENO, scroll_up.as_bytes());
         }
     }
     let _ = write_all_fd(
         libc::STDOUT_FILENO,
-        terminal_restore_escape(clear_on_restore),
+        if in_alt_screen {
+            terminal_restore_escape(false)
+        } else {
+            TERMINAL_RESTORE_NORMAL
+        },
     );
     if let Some(ref termios) = saved_termios {
         let _ = nix::sys::termios::tcsetattr(
@@ -2056,53 +2243,53 @@ fn run_attach_loop(
     let mut last_winsize = get_terminal_winsize();
 
     loop {
-        if let Some(deadline) = stdin_deadline {
-            if std::time::Instant::now() < deadline {
-                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                let timeout_ms = remaining.as_millis().min(i32::MAX as u128) as i32;
-                let mut warmup_pfd = libc::pollfd {
-                    fd: sock_fd,
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                let ret = unsafe { libc::poll(&mut warmup_pfd, 1, timeout_ms) };
-                if ret < 0 {
-                    let err = std::io::Error::last_os_error();
-                    if err.kind() == std::io::ErrorKind::Interrupted {
-                        continue;
-                    }
-                    return Err(NonoError::SandboxInit(format!(
-                        "poll() error in attach warm-up: {}",
-                        err
-                    )));
+        if let Some(deadline) = stdin_deadline
+            && std::time::Instant::now() < deadline
+        {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let timeout_ms = remaining.as_millis().min(i32::MAX as u128) as i32;
+            let mut warmup_pfd = libc::pollfd {
+                fd: sock_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ret = unsafe { libc::poll(&mut warmup_pfd, 1, timeout_ms) };
+            if ret < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
                 }
-                if warmup_pfd.revents & libc::POLLIN != 0 {
-                    match read_fd_once(sock_fd, &mut buf) {
-                        Ok(ReadFdOutcome::Data(n)) => {
-                            if let Err(err) = write_stdout_tracked(alt_screen_tracker, &buf[..n]) {
-                                return Err(NonoError::SandboxInit(format!(
-                                    "attach stdout write failed: {}",
-                                    err
-                                )));
-                            }
-                        }
-                        Ok(ReadFdOutcome::Eof) => break,
-                        Ok(ReadFdOutcome::Retry) => continue,
-                        Err(err) if is_socket_disconnect(&err) => break,
-                        Err(err) => {
+                return Err(NonoError::SandboxInit(format!(
+                    "poll() error in attach warm-up: {}",
+                    err
+                )));
+            }
+            if warmup_pfd.revents & libc::POLLIN != 0 {
+                match read_fd_once(sock_fd, &mut buf) {
+                    Ok(ReadFdOutcome::Data(n)) => {
+                        if let Err(err) = write_stdout_tracked(alt_screen_tracker, &buf[..n]) {
                             return Err(NonoError::SandboxInit(format!(
-                                "attach socket read failed: {}",
+                                "attach stdout write failed: {}",
                                 err
                             )));
                         }
                     }
+                    Ok(ReadFdOutcome::Eof) => break,
+                    Ok(ReadFdOutcome::Retry) => continue,
+                    Err(err) if is_socket_disconnect(&err) => break,
+                    Err(err) => {
+                        return Err(NonoError::SandboxInit(format!(
+                            "attach socket read failed: {}",
+                            err
+                        )));
+                    }
                 }
-                if warmup_pfd.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
-                    info!("PTY attach client observed attach socket close during warm-up");
-                    break;
-                }
-                continue;
             }
+            if warmup_pfd.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+                info!("PTY attach client observed attach socket close during warm-up");
+                break;
+            }
+            continue;
         }
 
         // SAFETY: pfds is a valid array on the stack
@@ -2188,15 +2375,15 @@ fn run_attach_loop(
 
         if pfds[2].revents & libc::POLLIN != 0 {
             drain_attach_resize_pipe();
-            if let Some(socket) = resize_socket {
-                if let Some(winsize) = get_terminal_winsize() {
-                    let changed = last_winsize
-                        .map(|last| last.ws_row != winsize.ws_row || last.ws_col != winsize.ws_col)
-                        .unwrap_or(true);
-                    if changed {
-                        let _ = send_attach_resize(socket, winsize);
-                        last_winsize = Some(winsize);
-                    }
+            if let Some(socket) = resize_socket
+                && let Some(winsize) = get_terminal_winsize()
+            {
+                let changed = last_winsize
+                    .map(|last| last.ws_row != winsize.ws_row || last.ws_col != winsize.ws_col)
+                    .unwrap_or(true);
+                if changed {
+                    let _ = send_attach_resize(socket, winsize);
+                    last_winsize = Some(winsize);
                 }
             }
         }
@@ -2208,11 +2395,11 @@ fn run_attach_loop(
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_attach_handshake, encode_attach_request_frame, read_fd_once,
-        select_attach_replay_bytes, terminal_restore_escape, write_all_fd, AltScreenTracker,
-        AttachedClient, PtyProxy, ReadFdOutcome, ScreenState, ATTACH_HANDSHAKE_MAGIC,
-        ATTACH_REQUEST_ATTACH, ATTACH_SCREEN_ENTER_ESCAPE, DEFAULT_DETACH_SEQUENCE,
-        ERASE_NATIVE_SCROLLBACK,
+        ATTACH_HANDSHAKE_MAGIC, ATTACH_REQUEST_ATTACH, ATTACH_SCREEN_ENTER_ESCAPE,
+        AltScreenTracker, AttachedClient, DEFAULT_DETACH_SEQUENCE, ERASE_NATIVE_SCROLLBACK,
+        PtyProxy, ReadFdOutcome, ScreenState, TERMINAL_RESTORE_NORMAL, decode_attach_handshake,
+        encode_attach_request_frame, read_fd_once, select_attach_replay_bytes,
+        terminal_restore_escape, write_all_fd,
     };
     use nix::libc;
     use std::collections::VecDeque;
@@ -2274,6 +2461,74 @@ mod tests {
     fn terminal_restore_escape_can_clear_screen() {
         let esc = std::str::from_utf8(terminal_restore_escape(true)).unwrap_or("");
         assert!(esc.ends_with("\u{1b}[2J\u{1b}[H"));
+    }
+
+    #[test]
+    fn terminal_restore_normal_omits_alt_screen_exit() {
+        let esc = std::str::from_utf8(TERMINAL_RESTORE_NORMAL).unwrap_or("");
+        assert!(
+            !esc.contains("\u{1b}[?1049l"),
+            "normal-mode restore must not exit alternate screen"
+        );
+        assert!(
+            !esc.contains("\u{1b}[2J"),
+            "normal-mode restore must not clear screen"
+        );
+        for mode in ["1000", "1002", "1003", "1005", "1006", "1015"] {
+            assert!(
+                esc.contains(&format!("\u{1b}[?{mode}l")),
+                "normal-mode restore must still disable mouse mode {mode}"
+            );
+        }
+    }
+
+    #[test]
+    fn screen_plaintext_includes_raw_scrollback_for_diagnostics() {
+        let mut proxy = build_test_proxy(&DEFAULT_DETACH_SEQUENCE);
+        proxy.record_output(
+            b"Failed to extract bundled package: Error: EPERM: operation not permitted, mkdir '/tmp/copilot/pkg/darwin-arm64'\r\n",
+        );
+
+        let text = proxy.screen_plaintext();
+        assert!(text.contains("EPERM: operation not permitted"));
+        assert!(text.contains("mkdir '/tmp/copilot/pkg/darwin-arm64'"));
+    }
+
+    #[test]
+    fn cursor_column_nonzero_after_output_without_trailing_newline() {
+        let mut proxy = build_test_proxy(&DEFAULT_DETACH_SEQUENCE);
+        proxy.record_output(b"hello");
+        let (_row, col) = proxy.screen.cursor_position();
+        assert!(
+            col > 0,
+            "cursor column should be > 0 after output without a trailing newline"
+        );
+    }
+
+    #[test]
+    fn cursor_column_zero_after_output_with_trailing_newline() {
+        let mut proxy = build_test_proxy(&DEFAULT_DETACH_SEQUENCE);
+        proxy.record_output(b"hello\r\n");
+        let (_row, col) = proxy.screen.cursor_position();
+        assert_eq!(
+            col, 0,
+            "cursor column should be 0 after output ending with a newline"
+        );
+    }
+
+    #[test]
+    fn drain_master_output_captures_tail_before_parent_prompt() {
+        let (master_reader, mut master_writer) = UnixStream::pair().expect("socket pair");
+        master_writer
+            .write_all(b"final child stderr line\r\n")
+            .expect("write PTY output");
+        drop(master_writer);
+        let master = unsafe { OwnedFd::from_raw_fd(master_reader.into_raw_fd()) };
+        let mut proxy = build_test_proxy_with_master(master, &DEFAULT_DETACH_SEQUENCE);
+
+        proxy.drain_master_output(Duration::from_millis(10));
+
+        assert!(proxy.screen_plaintext().contains("final child stderr line"));
     }
 
     #[test]

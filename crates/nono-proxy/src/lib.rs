@@ -24,12 +24,14 @@ pub mod credential;
 pub mod error;
 pub mod external;
 pub mod filter;
+pub mod forward;
 pub mod oauth2;
 pub mod reverse;
 pub mod route;
 pub mod server;
+pub mod tls_intercept;
 pub mod token;
 
 pub use config::ProxyConfig;
 pub use error::{ProxyError, Result};
-pub use server::{start, ProxyHandle};
+pub use server::{ProxyHandle, start};

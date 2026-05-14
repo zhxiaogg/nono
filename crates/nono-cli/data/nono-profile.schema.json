@@ -45,6 +45,10 @@
       "$ref": "#/$defs/NetworkConfig",
       "description": "Network access configuration including proxy settings, credential injection, and port allowlists."
     },
+    "linux": {
+      "$ref": "#/$defs/LinuxConfig",
+      "description": "Linux-specific hardening controls."
+    },
     "env_credentials": {
       "$ref": "#/$defs/SecretsConfig",
       "description": "Maps keystore account names (or op://, apple-password://, env:// URIs) to environment variable names. Secrets are loaded from the system keystore at startup."
@@ -52,6 +56,13 @@
     "secrets": {
       "$ref": "#/$defs/SecretsConfig",
       "description": "Alias for env_credentials. Maps keystore account names to environment variable names."
+    },
+    "environment": {
+      "oneOf": [
+        { "$ref": "#/$defs/EnvironmentConfig" },
+        { "type": "null" }
+      ],
+      "description": "Controls which environment variables are passed to the sandboxed process. By default all variables are inherited."
     },
     "workdir": {
       "$ref": "#/$defs/WorkdirConfig",
@@ -188,6 +199,25 @@
       "enum": ["error", "insecure_proxy"],
       "description": "WSL2 proxy fallback policy. 'error' (default) refuses to run if proxy-only mode cannot be kernel-enforced. 'insecure_proxy' allows degraded execution where the credential proxy injects credentials but the sandboxed process is not prevented from bypassing the proxy."
     },
+    "LinuxConfig": {
+      "type": "object",
+      "description": "Linux-specific hardening controls.",
+      "additionalProperties": false,
+      "properties": {
+        "af_unix_mediation": {
+          "oneOf": [
+            { "$ref": "#/$defs/LinuxAfUnixMediation" },
+            { "type": "null" }
+          ],
+          "description": "Opt-in pathname AF_UNIX mediation. 'off' preserves compatibility. 'pathname' requires explicit filesystem.unix_socket* grants for pathname Unix socket connect/bind."
+        }
+      }
+    },
+    "LinuxAfUnixMediation": {
+      "type": "string",
+      "enum": ["off", "pathname"],
+      "description": "Linux pathname AF_UNIX mediation mode."
+    },
     "ProfileSignalMode": {
       "type": "string",
       "enum": ["isolated", "allow_same_sandbox", "allow_all"],
@@ -203,6 +233,59 @@
       "enum": ["shared_memory_only", "full"],
       "description": "IPC mode for the sandboxed process. 'shared_memory_only' allows POSIX shared memory but denies semaphores. 'full' enables both shared memory and semaphores (required for Python multiprocessing and similar runtimes)."
     },
+    "WhenPredicate": {
+      "oneOf": [
+        { "type": "string" },
+        {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 1
+        }
+      ],
+      "description": "Platform predicate string or any-of array, e.g. linux, macos:>=15, linux:fedora-like:>=43, linux:fedora:>=43:workstation, or !linux:nixos."
+    },
+    "ConditionalPath": {
+      "oneOf": [
+        { "type": "string" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["path"],
+          "properties": {
+            "path": { "type": "string" },
+            "when": { "$ref": "#/$defs/WhenPredicate" }
+          }
+        }
+      ]
+    },
+    "ConditionalName": {
+      "oneOf": [
+        { "type": "string" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name"],
+          "properties": {
+            "name": { "type": "string" },
+            "when": { "$ref": "#/$defs/WhenPredicate" }
+          }
+        }
+      ]
+    },
+    "ConditionalOrigin": {
+      "oneOf": [
+        { "type": "string" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["origin"],
+          "properties": {
+            "origin": { "type": "string" },
+            "when": { "$ref": "#/$defs/WhenPredicate" }
+          }
+        }
+      ]
+    },
     "FilesystemConfig": {
       "type": "object",
       "description": "Filesystem access rules for the sandboxed process.",
@@ -210,43 +293,53 @@
       "properties": {
         "allow": {
           "type": "array",
-          "items": { "type": "string" },
+          "items": { "$ref": "#/$defs/ConditionalPath" },
           "description": "Directories with read+write access."
         },
         "read": {
           "type": "array",
-          "items": { "type": "string" },
+          "items": { "$ref": "#/$defs/ConditionalPath" },
           "description": "Directories with read-only access."
         },
         "write": {
           "type": "array",
-          "items": { "type": "string" },
+          "items": { "$ref": "#/$defs/ConditionalPath" },
           "description": "Directories with write-only access."
         },
         "allow_file": {
           "type": "array",
-          "items": { "type": "string" },
+          "items": { "$ref": "#/$defs/ConditionalPath" },
           "description": "Single files with read+write access."
         },
         "read_file": {
           "type": "array",
-          "items": { "type": "string" },
+          "items": { "$ref": "#/$defs/ConditionalPath" },
           "description": "Single files with read-only access."
         },
         "write_file": {
           "type": "array",
-          "items": { "type": "string" },
+          "items": { "$ref": "#/$defs/ConditionalPath" },
           "description": "Single files with write-only access."
         },
         "deny": {
           "type": "array",
-          "items": { "type": "string" },
+          "items": { "$ref": "#/$defs/ConditionalPath" },
           "description": "Paths denied filesystem access. Denies apply regardless of other allow rules."
         },
         "bypass_protection": {
           "type": "array",
-          "items": { "type": "string" },
+          "items": { "$ref": "#/$defs/ConditionalPath" },
           "description": "Paths exempted from group-level deny rules. Each path must also appear in an allow/read/write section to actually grant access; bypass_protection only removes the deny."
+        },
+        "suppress_save_prompt": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ConditionalPath" },
+          "description": "Paths whose runtime denials should not be offered in the save-profile prompt. Does not grant access, remove deny rules, or hide diagnostic output."
+        },
+        "ignore": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ConditionalPath" },
+          "description": "Alias for suppress_save_prompt. Prefer filesystem.suppress_save_prompt in new profiles."
         }
       }
     },
@@ -257,12 +350,12 @@
       "properties": {
         "include": {
           "type": "array",
-          "items": { "type": "string" },
+          "items": { "$ref": "#/$defs/ConditionalName" },
           "description": "Policy group names to include. Groups are resolved against policy.json."
         },
         "exclude": {
           "type": "array",
-          "items": { "type": "string" },
+          "items": { "$ref": "#/$defs/ConditionalName" },
           "description": "Policy group names to remove from the resolved group set (subtractive composition)."
         }
       }
@@ -392,7 +485,7 @@
         },
         "credential_key": {
           "type": "string",
-          "description": "Keystore account name for the credential (e.g., \"telegram_bot_token\"), or a 1Password op:// URI, or an apple-password:// URI. Mutually exclusive with auth."
+          "description": "Keystore account name for the credential (e.g., \"telegram_bot_token\"), or a 1Password op:// URI, apple-password:// URI, file:// URI, or env:// URI (e.g., \"env://MY_TOKEN\"). Mutually exclusive with auth."
         },
         "auth": {
           "$ref": "#/$defs/OAuth2Config",
@@ -446,7 +539,7 @@
             { "type": "string" },
             { "type": "null" }
           ],
-          "description": "Explicit environment variable name for the phantom token (e.g., \"OPENAI_API_KEY\"). Required when credential_key is a URI manager reference (op:// or apple-password://)."
+          "description": "Explicit environment variable name for the phantom token (e.g., \"OPENAI_API_KEY\"). Required when credential_key is a URI manager reference (op://, apple-password://, or file://). Optional for env:// (derived from the URI)."
         },
         "endpoint_rules": {
           "type": "array",
@@ -579,8 +672,41 @@
       "type": "object",
       "description": "Maps keystore account names (or op://, apple-password://, env:// URIs) to environment variable names. Secrets are loaded from the system keystore under the service name \"nono\".",
       "additionalProperties": {
-        "type": "string",
-        "description": "Environment variable name to inject the secret value into."
+        "oneOf": [
+          {
+            "type": "string",
+            "description": "Environment variable name to inject the secret value into."
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["env_var"],
+            "properties": {
+              "env_var": {
+                "type": "string",
+                "description": "Environment variable name to inject the secret value into."
+              },
+              "when": { "$ref": "#/$defs/WhenPredicate" }
+            }
+          }
+        ]
+      }
+    },
+    "EnvironmentConfig": {
+      "type": "object",
+      "description": "Controls which environment variables are passed to the sandboxed process. By default all variables are inherited. Precedence (highest to lowest): 1. Hardcoded dangerous vars (always stripped), 2. deny_vars (stripped even if in allow_vars), 3. allow_vars (if non-empty, only matching vars pass).",
+      "additionalProperties": false,
+      "properties": {
+        "allow_vars": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^([^*]+\\*?|\\*)$" },
+          "description": "Allow-list of environment variable names passed to the sandboxed process. Supports exact names (\"PATH\") and prefix patterns ending with * (\"AWS_*\"). When empty or absent, all variables are allowed."
+        },
+        "deny_vars": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^([^*]+\\*?|\\*)$" },
+          "description": "Deny-list of environment variable names stripped from the sandboxed process. Supports exact names (\"GH_TOKEN\") and prefix patterns ending with * (\"GITHUB_*\"). Denied vars are stripped even if they also appear in allow_vars."
+        }
       }
     },
     "WorkdirConfig": {
@@ -651,7 +777,7 @@
       "properties": {
         "allow_origins": {
           "type": "array",
-          "items": { "type": "string" },
+          "items": { "$ref": "#/$defs/ConditionalOrigin" },
           "description": "Allowed URL origins (scheme + host, e.g., \"https://console.anthropic.com\"). The supervisor validates each URL open request against this list. An empty list means no URLs are allowed."
         },
         "allow_localhost": {
