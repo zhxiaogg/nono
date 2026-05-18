@@ -1665,7 +1665,12 @@ pub struct RunArgs {
     /// Kill the process if it has not entered alt-screen mode after this many seconds.
     /// Startup banners and log lines do not count; only a full-screen TUI transition satisfies the check.
     /// Set to 0 to disable. Env: NONO_STARTUP_TIMEOUT.
-    #[arg(long = "startup-timeout", value_name = "SECS", env = "NONO_STARTUP_TIMEOUT", help_heading = "OPTIONS")]
+    #[arg(
+        long = "startup-timeout",
+        value_name = "SECS",
+        env = "NONO_STARTUP_TIMEOUT",
+        help_heading = "OPTIONS"
+    )]
     pub startup_timeout_secs: Option<u64>,
 
     /// Disable the audit trail for this session
@@ -1735,7 +1740,12 @@ pub struct ShellArgs {
     /// Kill the process if it has not entered alt-screen mode after this many seconds.
     /// Startup banners and log lines do not count; only a full-screen TUI transition satisfies the check.
     /// Set to 0 to disable. Env: NONO_STARTUP_TIMEOUT.
-    #[arg(long = "startup-timeout", value_name = "SECS", env = "NONO_STARTUP_TIMEOUT", help_heading = "OPTIONS")]
+    #[arg(
+        long = "startup-timeout",
+        value_name = "SECS",
+        env = "NONO_STARTUP_TIMEOUT",
+        help_heading = "OPTIONS"
+    )]
     pub startup_timeout_secs: Option<u64>,
 
     /// Print help

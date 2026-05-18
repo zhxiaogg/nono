@@ -127,7 +127,6 @@ fn recommended_builtin_profile(program: &Path) -> Option<&'static str> {
     }
 }
 
-
 pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     let LaunchPlan {
         program,
