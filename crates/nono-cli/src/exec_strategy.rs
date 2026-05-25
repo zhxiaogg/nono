@@ -2249,8 +2249,12 @@ fn run_supervisor_loop(
         match ret.cmp(&0) {
             std::cmp::Ordering::Greater => {
                 if sock_fd_active && pfds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
-                    if notify_raw_fd.is_some() || proxy_notify_raw_fd.is_some() || pty.is_some() {
-                        debug!("Supervisor socket closed, continuing for seccomp/proxy/PTY");
+                    if notify_raw_fd.is_some()
+                        || proxy_notify_raw_fd.is_some()
+                        || pty.is_some()
+                        || listener_raw_fd.is_some()
+                    {
+                        debug!("Supervisor socket closed, continuing for seccomp/proxy/PTY/URL listener");
                         sock_fd_active = false;
                     } else {
                         debug!("Supervisor socket closed by child");
@@ -2277,6 +2281,7 @@ fn run_supervisor_loop(
                             if notify_raw_fd.is_none()
                                 && proxy_notify_raw_fd.is_none()
                                 && pty.is_none()
+                                && listener_raw_fd.is_none()
                             {
                                 break;
                             }
