@@ -413,6 +413,18 @@
         ]
       }
     },
+    "java_runtime": {
+      "description": "Java runtime and build tool paths (SDKMAN, Maven, Gradle)",
+      "allow": {
+        "read": [
+          "~/.sdkman",
+          "~/.m2/repository",
+          "~/.m2/wrapper",
+          "~/.gradle/caches",
+          "~/.gradle/wrapper"
+        ]
+      }
+    },
     "homebrew_macos": {
       "description": "Homebrew installation paths on macOS",
       "platform": "macos",
@@ -769,6 +781,28 @@
       "security": {
         "signal_mode": "isolated"
       },
+      "filesystem": {},
+      "network": { "block": false, "network_profile": "developer" },
+      "workdir": { "access": "readwrite" },
+      "interactive": false
+    },
+    "java-dev": {
+      "extends": "default",
+      "meta": {
+        "name": "java-dev",
+        "version": "1.0.0",
+        "description": "Java SDK development profile with SDKMAN, Maven, and Gradle support",
+        "author": "always-further"
+      },
+      "groups": {
+        "include": ["java_runtime"]
+      },
+      "security": {
+        "signal_mode": "isolated"
+      },
+      "unsafe_macos_seatbelt_rules": [
+        "(allow sysctl-write (sysctl-name \"kern.grade_cputype\"))"
+      ],
       "filesystem": {},
       "network": { "block": false, "network_profile": "developer" },
       "workdir": { "access": "readwrite" },
