@@ -114,8 +114,13 @@ pub struct ProxyConfig {
 ///
 /// The Keychain item's access control depends on the binary's code-signing
 /// identity. Release-signed builds get per-app isolation; unsigned dev builds
-/// allow any local process to read the key. The 24h CA validity limits
-/// exposure in either case.
+/// allow any local process to read the key.
+///
+/// Because the CA is trusted user-wide during its validity window, any
+/// same-user process that can read the Keychain item could mint certificates
+/// trusted by macOS trust consumers. Release-signed builds are expected to
+/// receive stronger Keychain access isolation than unsigned development builds.
+/// The configurable CA validity (`--proxy-ca-validity`) limits exposure.
 #[derive(Clone)]
 pub struct PreloadedCa {
     /// PKCS#8 DER-encoded private key for the CA. Zeroized on drop.

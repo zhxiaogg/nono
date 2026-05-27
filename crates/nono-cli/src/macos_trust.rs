@@ -122,6 +122,9 @@ fn generate_and_trust_new_ca(validity: Duration) -> Result<Option<PreloadedCa>> 
 
     info!("Adding proxy CA to macOS trust store (you may be prompted for authentication)...");
     if let Err(e) = trust_cert(&sec_cert) {
+        // Trust failed — remove the orphaned CA bundle from Keychain so it
+        // doesn't linger untrusted and confuse the next session's load path.
+        delete_existing_ca();
         match e {
             TrustCertError::UserCancelled => {
                 warn!(
