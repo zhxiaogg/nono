@@ -24,8 +24,8 @@
 
 use crate::error::{ProxyError, Result};
 use rcgen::{
-    BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, KeyUsagePurpose,
-    PKCS_ECDSA_P256_SHA256,
+    BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, Issuer, KeyPair,
+    KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
 };
 use rustls::pki_types::PrivatePkcs8KeyDer;
 use rustls::pki_types::pem::PemObject;
@@ -43,19 +43,14 @@ pub const CA_VALIDITY_DEFAULT: Duration = Duration::from_secs(24 * 60 * 60);
 /// via [`EphemeralCa::cert_pem`] for inclusion in the trust bundle written
 /// for the sandboxed child.
 pub struct EphemeralCa {
-    /// Parsed key pair used by `rcgen` to sign minted leaves.
-    key_pair: KeyPair,
     /// Raw PKCS#8 DER bytes of the CA private key. Zeroized on `Drop`.
     /// Exposed via [`Self::key_der`] for persistence to macOS Keychain.
     key_pkcs8_der: Zeroizing<Vec<u8>>,
-    /// The CA certificate in `rcgen` form so leaves can be signed against it.
-    /// Note: in `from_existing`, this is a re-signed reconstruction used only
-    /// as rcgen's issuer type for `signed_by()`. The authoritative cert bytes
-    /// for the TLS chain and trust bundle come from `cert_der`.
-    ca_cert: rcgen::Certificate,
+    /// Issuer for signing minted leaf certificates (owns CA params and key pair).
+    issuer: Issuer<'static, KeyPair>,
     /// Authoritative DER bytes of the CA certificate, used in TLS chains.
-    /// In `generate()` this matches `ca_cert.der()`. In `from_existing()` this
-    /// is the original cert DER (not the re-signed reconstruction), ensuring
+    /// In `generate()` this comes from the self-signed cert. In `from_existing()`
+    /// this is the original cert DER (not the re-signed reconstruction), ensuring
     /// the chain cert matches what's in the trust store.
     cert_der: Vec<u8>,
     /// Cached PEM encoding of the public certificate.
@@ -87,15 +82,6 @@ impl EphemeralCa {
             })?;
         let key_pkcs8_der = Zeroizing::new(key_der.to_vec());
 
-        let params = CertificateParams::from_ca_cert_pem(cert_pem).map_err(|e| {
-            ProxyError::Config(format!("failed to parse persisted CA cert PEM: {e}"))
-        })?;
-        let ca_cert = params.self_signed(&key_pair).map_err(|e| {
-            ProxyError::Config(format!(
-                "failed to reconstruct CA from persisted material: {e}"
-            ))
-        })?;
-
         let cert_der = rustls::pki_types::CertificateDer::from_pem_slice(cert_pem.as_bytes())
             .map_err(|e| {
                 ProxyError::Config(format!(
@@ -111,11 +97,15 @@ impl EphemeralCa {
         validate_key_cert_binding(&key_pair, &cert_der)?;
 
         let not_after = extract_not_after_from_der(&cert_der)?;
+        let issuer = Issuer::from_ca_cert_pem(cert_pem, key_pair).map_err(|e| {
+            ProxyError::Config(format!(
+                "failed to reconstruct issuer from persisted material: {e}"
+            ))
+        })?;
 
         Ok(Self {
-            key_pair,
             key_pkcs8_der,
-            ca_cert,
+            issuer,
             cert_der,
             cert_pem: cert_pem.to_string(),
             not_after,
@@ -156,16 +146,16 @@ impl EphemeralCa {
         dn.push(DnType::CommonName, cn);
         params.distinguished_name = dn;
 
-        let ca_cert = params
+        let self_signed = params
             .self_signed(&key_pair)
             .map_err(|e| ProxyError::Config(format!("failed to self-sign ephemeral CA: {}", e)))?;
-        let cert_pem = ca_cert.pem();
-        let cert_der = ca_cert.der().to_vec();
+        let cert_pem = self_signed.pem();
+        let cert_der = self_signed.der().to_vec();
+        let issuer = Issuer::new(params, key_pair);
 
         Ok(Self {
-            key_pair,
             key_pkcs8_der,
-            ca_cert,
+            issuer,
             cert_der,
             cert_pem,
             not_after,
@@ -196,7 +186,6 @@ impl EphemeralCa {
         let mut pem = String::with_capacity(encoded.len() + 64);
         pem.push_str("-----BEGIN PRIVATE KEY-----\n");
         for chunk in encoded.as_bytes().chunks(64) {
-            // base64 output is always ASCII — valid UTF-8 by construction
             pem.push_str(std::str::from_utf8(chunk).unwrap_or_default());
             pem.push('\n');
         }
@@ -214,15 +203,9 @@ impl EphemeralCa {
         &self.cert_der
     }
 
-    /// Borrow the parsed CA certificate (used by [`super::cert_cache`] to
-    /// sign minted leaves via `signed_by`).
-    pub(super) fn ca_cert(&self) -> &rcgen::Certificate {
-        &self.ca_cert
-    }
-
-    /// Borrow the parsed key pair (used by [`super::cert_cache`] to sign).
-    pub(super) fn key_pair(&self) -> &KeyPair {
-        &self.key_pair
+    /// Issuer used by [`super::cert_cache`] to sign minted leaf certificates.
+    pub(super) fn issuer(&self) -> &Issuer<'static, KeyPair> {
+        &self.issuer
     }
 
     /// CA certificate expiry time. Leaf certs are minted with this same
@@ -236,7 +219,7 @@ impl std::fmt::Debug for EphemeralCa {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EphemeralCa")
             .field("subject", &"CN=nono-session-ca")
-            .field("key_pair", &"[REDACTED]")
+            .field("issuer", &"[REDACTED]")
             .field("key_pkcs8_der", &"[REDACTED]")
             .field("cert_pem_len", &self.cert_pem.len())
             .finish()
