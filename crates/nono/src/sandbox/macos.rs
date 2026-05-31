@@ -476,6 +476,49 @@ fn push_localhost_tcp_outbound_seatbelt_rules(profile: &mut String, localhost_po
     }
 }
 
+/// The running macOS major version (e.g. `13` for Ventura), read at runtime from the
+/// `kern.osproductversion` sysctl. Used to decide whether `com.apple.SecurityServer`
+/// can be allowed for TLS without exposing the keychain (safe on macOS 13+, where the
+/// keychain is gated by keychaind/secd). Returns `None` if it cannot be determined, in
+/// which case callers treat the host as modern (allow). Detected at runtime because the
+/// binary may execute on a different macOS version than it was built on.
+fn macos_major_version() -> Option<u32> {
+    let name = c"kern.osproductversion";
+    let mut size: libc::size_t = 0;
+    // First query the length of the version string.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || size == 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; size];
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            buf.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&buf);
+    s.trim_end_matches(['\0', '\n'])
+        .split('.')
+        .next()?
+        .parse()
+        .ok()
+}
+
 /// Generate a Seatbelt profile from capabilities
 ///
 /// This is a pure primitive - it generates rules ONLY for paths in the CapabilitySet.
@@ -530,8 +573,17 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
     // Mach IPC, bypassing file-level deny rules in profiles that do NOT opt in.
     profile.push_str("(allow mach-lookup)\n");
     if !has_explicit_keychain_db_access(caps) {
-        // Legacy keychain daemon names (macOS < 13)
-        profile.push_str("(deny mach-lookup (global-name \"com.apple.SecurityServer\"))\n");
+        // com.apple.SecurityServer is required by macOS Secure Transport (e.g. cargo's
+        // bundled libgit2) to evaluate the server certificate during the TLS handshake.
+        // On macOS 13+ the keychain itself is reached via keychaind/secd (denied below),
+        // so SecurityServer can be allowed without exposing keychain items — unlocking
+        // and reading secrets still fails. On macOS < 13 SecurityServer IS a keychain
+        // daemon, so it is kept denied there (grant a keychain DB to opt into TLS +
+        // keychain on those versions). The macOS version is detected at runtime, not via
+        // cfg: the binary may run on a different version than it was compiled on.
+        if macos_major_version().is_some_and(|v| v < 13) {
+            profile.push_str("(deny mach-lookup (global-name \"com.apple.SecurityServer\"))\n");
+        }
         profile.push_str("(deny mach-lookup (global-name \"com.apple.securityd\"))\n");
         // Modern keychain daemon (macOS 13 Ventura+). Legacy SecKeychain APIs
         // route here on Ventura and later, bypassing the legacy service denies above.
@@ -1271,7 +1323,12 @@ mod tests {
         let caps = CapabilitySet::new();
         let profile = generate_profile(&caps).unwrap();
 
-        assert!(profile.contains("(deny mach-lookup (global-name \"com.apple.SecurityServer\"))"));
+        // SecurityServer: denied on macOS < 13 (it is a keychain daemon there), allowed
+        // on 13+ (only needed for Secure Transport TLS; keychain is gated by keychaind/
+        // secd). The runtime gate is version-driven, so assert against the running host.
+        let securityserver_denied =
+            profile.contains("(deny mach-lookup (global-name \"com.apple.SecurityServer\"))");
+        assert_eq!(securityserver_denied, macos_major_version().is_some_and(|v| v < 13));
         assert!(profile.contains("(deny mach-lookup (global-name \"com.apple.securityd\"))"));
         // Modern keychain daemon (macOS 13 Ventura+)
         assert!(
